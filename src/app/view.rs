@@ -28,7 +28,7 @@ use super::{
 };
 use crate::ui::scrollbar::ScrollbarGeom;
 
-/// One laid-out central-pane tab (Agent/Shell/Review) on the pane's top border:
+/// One laid-out central-pane tab (Agent/Review/Shell/Activity) on the pane's top border:
 /// its on-border rect (click target + paint position), the display label (with
 /// any shortcut baked in, e.g. `"Review · F7"`), and whether it's the active
 /// view. Rendered as a filled pill via `ui::render_pill`, exactly like the
@@ -133,8 +133,8 @@ fn central_tabs_block_width(tabs: &[CentralTabSpec]) -> u16 {
 /// footer's `status_bar::fit_pills`:
 ///
 /// 1. strip the `· shortcut` suffix from every label (~4 cols/pill);
-/// 2. drop the lowest-priority tab — Shell first, then Review — but keep Agent
-///    (the fallback view) and the currently-active tab untouched.
+/// 2. drop the lowest-priority tab — Activity first, then Shell, then Review —
+///    but keep Agent (the fallback view) and the currently-active tab untouched.
 ///
 /// Leaves at least the Agent + active pair; only a pane too narrow for even
 /// those two overflows (nowhere left to trim to).
@@ -150,9 +150,14 @@ fn trim_central_tabs(tabs: &mut Vec<CentralTabSpec>, active: CentralTab, usable:
             }
             continue;
         }
-        // 2. drop the lowest-priority droppable tab (Shell → Review); never
-        //    Agent (the fallback view) nor the active tab (must stay visible).
-        let drop_order = [CentralTab::Shell, CentralTab::Review];
+        // 2. drop the lowest-priority droppable tab (Activity → Shell →
+        //    Review: the last appended goes first); never Agent (the fallback
+        //    view) nor the active tab (must stay visible).
+        let drop_order = [
+            CentralTab::CcActivity,
+            CentralTab::Shell,
+            CentralTab::Review,
+        ];
         let victim = drop_order
             .iter()
             .copied()
@@ -1029,7 +1034,7 @@ impl App {
         if self.active_review().is_some() {
             self.render_code_review_pane(frame, terminal, tabs_width);
         } else if self.active_cc_activity().is_some() {
-            self.render_cc_activity_pane(frame, terminal);
+            self.render_cc_activity_pane(frame, terminal, tabs_width);
         } else {
             self.render_terminal_pane(frame, terminal, tabs_width);
         }
@@ -1073,7 +1078,7 @@ impl App {
 
     /// Render the open activity view (transcript) into the central pane (dimmed
     /// when not the focused pane) and record its click/scroll targets.
-    fn render_cc_activity_pane(&mut self, frame: &mut Frame, terminal: Rect) {
+    fn render_cc_activity_pane(&mut self, frame: &mut Frame, terminal: Rect, tabs_width: u16) {
         let level = if self.focus == InputFocus::CcActivity {
             crate::ui::FocusLevel::Focused
         } else {
@@ -1081,7 +1086,7 @@ impl App {
         };
         let Some(hits) = self
             .active_cc_activity_mut()
-            .map(|ca| crate::ui::cc_activity::render(frame, terminal, ca, level))
+            .map(|ca| crate::ui::cc_activity::render(frame, terminal, ca, level, tabs_width))
         else {
             return;
         };
@@ -1186,8 +1191,8 @@ impl App {
     /// label (shortcut baked in), and whether it's the active view. Packing
     /// mirrors `render_button_bar` (` label ` chip = label+2 wide, one-space
     /// gaps) so the recorded hitboxes match the pills `draw_central_tabs`
-    /// paints. Shell/Review are gated by their feature flags, and the pane's
-    /// right-aligned info title budgets itself around the strip
+    /// paints. Review/Shell/Activity are gated by their feature flags, and the
+    /// pane's right-aligned info title budgets itself around the strip
     /// ([`central_tabs_width`]) — so the two share the border instead of
     /// colliding, however long the branch or narrow the pane.
     ///
@@ -1197,9 +1202,8 @@ impl App {
     /// another: (1) strip the `· shortcut` suffix from every label to reclaim
     /// ~4 cols/pill, then (2) drop the lowest-priority tabs — but **never the
     /// active tab** (you must always be able to see which view you're in) and
-    /// never Agent (the base view you fall back to). A future extra tab (e.g. an
-    /// F9 fullscreen toggle) simply appends to `specs` and is shed first by this
-    /// same trim on a small window.
+    /// never Agent (the base view you fall back to). The `F9` Activity tab is
+    /// appended last and so shed first.
     fn central_tab_cells(&self, area: Rect, start_x: u16) -> Vec<CentralTabCell> {
         // No tabs on the empty "No Session" screen, or when the pane is too
         // narrow to hold even one.
@@ -2714,6 +2718,39 @@ mod tests {
             vec![CentralTab::Agent, CentralTab::Shell],
             "the active Shell tab is protected; Review is shed instead"
         );
+    }
+
+    /// The fork's fourth tab: `full_tabs` plus `Activity · F9`.
+    fn tabs_with_activity() -> Vec<CentralTabSpec> {
+        let mut tabs = full_tabs();
+        tabs.push(CentralTabSpec {
+            tab: CentralTab::CcActivity,
+            name: "Activity",
+            shortcut: Some("F9".to_string()),
+        });
+        tabs
+    }
+
+    #[test]
+    fn central_tabs_shed_activity_first() {
+        // ` Agent ` (7) + ` Review ` (8) + ` Shell ` (7) + 2 gaps = 24: room for
+        // three bare chips, so the last-appended Activity goes.
+        let mut tabs = tabs_with_activity();
+        trim_central_tabs(&mut tabs, CentralTab::Agent, 24);
+        let kept: Vec<CentralTab> = tabs.iter().map(|t| t.tab).collect();
+        assert_eq!(
+            kept,
+            vec![CentralTab::Agent, CentralTab::Review, CentralTab::Shell]
+        );
+    }
+
+    #[test]
+    fn central_tabs_keep_an_active_activity_tab() {
+        // Activity is the view in use: Shell and then Review go instead.
+        let mut tabs = tabs_with_activity();
+        trim_central_tabs(&mut tabs, CentralTab::CcActivity, 18);
+        let kept: Vec<CentralTab> = tabs.iter().map(|t| t.tab).collect();
+        assert_eq!(kept, vec![CentralTab::Agent, CentralTab::CcActivity]);
     }
 
     #[test]

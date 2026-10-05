@@ -189,8 +189,13 @@ pub(crate) fn render(
     area: Rect,
     state: &mut CcActivityState,
     level: FocusLevel,
+    // The span the central-pane tab strip occupies on the top border
+    // (`app::view::central_tabs_width`); the right-aligned title is truncated
+    // to the remaining width. See `terminal_view::render_terminal`.
+    tabs_width: u16,
 ) -> CcActivityHits {
     let title = format!(" Activity · {} ", open_label(state));
+    let title = crate::ui::fit_right_title(&title, area.width, tabs_width);
     let block = focus_block("", level)
         .title_top(Line::from(Span::styled(title, title_style(level))).right_aligned());
     let inner = block.inner(area);
