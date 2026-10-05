@@ -5222,8 +5222,11 @@ impl App {
             }
             // Cancelled (or the picker vanished some other way): drop the
             // result. The worktrees stay on disk, matching a cancel after
-            // creation.
+            // creation. What was staged above goes too, or the next fork or
+            // wizard would spawn with this flow's dirs and base branch.
             AgentPick::Open | AgentPick::Cancelled => {
+                self.new_session.additional_dirs.clear();
+                self.new_session.spawn_base_branch = None;
                 self.set_info("Session creation cancelled (worktrees kept on disk)");
             }
             // No overlapping picker — classic picker-after-create path.
@@ -18521,7 +18524,7 @@ mod tests {
         let tx = app.worktree_create.start();
         app.pending_worktree_create = Some(PendingWorktreeCreate {
             backend: None,
-            normal_repos: vec![],
+            normal_repos: vec![PathBuf::from("/other")],
             session_name: Some("sess".into()),
             base_branch: "main".into(),
             agent_pick: AgentPick::Open,
@@ -18544,6 +18547,11 @@ mod tests {
         assert!(!app.session_spawn.in_progress(), "nothing spawns");
         assert!(matches!(app.modal, modals::Modal::None));
         assert!(app.pending_worktree_create.is_none());
+        assert!(
+            app.new_session.additional_dirs.is_empty(),
+            "the cancelled flow's dirs must not reach the next spawn"
+        );
+        assert!(app.new_session.spawn_base_branch.is_none());
     }
 
     /// After the agent pick the wizard is closed but its worktree is still
@@ -20811,6 +20819,7 @@ mod tests {
     fn session_name_esc_after_create_cancels_and_keeps_worktrees() {
         let mut app = app_with_sessions(0);
         app.new_session.spawn_config = Some(SessionConfig::default());
+        app.new_session.spawn_base_branch = Some("main".into());
         app.new_session.spawn_worktrees = vec![WorktreeInfo {
             repo_path: PathBuf::from("/repo"),
             worktree_path: PathBuf::from("/wt"),
@@ -20825,6 +20834,10 @@ mod tests {
         assert!(matches!(app.modal, modals::Modal::None));
         assert!(app.new_session.spawn_worktrees.is_empty());
         assert!(app.new_session.saved_repo_picker.is_none());
+        assert!(
+            app.new_session.spawn_base_branch.is_none(),
+            "the cancelled flow's base must not reach the next spawn"
+        );
         let msg = app.status_message.as_ref().unwrap();
         assert!(msg.text.contains("kept on disk"));
     }

@@ -1492,6 +1492,7 @@ impl App {
             self.new_session.import = false;
             self.new_session.parent_session_id = None;
             self.new_session.additional_dirs.clear();
+            self.new_session.spawn_base_branch = None;
             self.new_session.workspace_dir = None;
             self.new_session.saved_repo_picker = None;
             self.set_info("Cancelled — created worktree(s) kept on disk");
