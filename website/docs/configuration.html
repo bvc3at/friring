@@ -390,8 +390,8 @@ code_review   = true           # native diff-review pane (F7)
 mouse         = true
 notifications = true
 soft_delete   = true           # Ctrl+D soft-deletes (Ctrl+Z undo); false = hard-delete
-version_check = false          # opt-in: makes a network call
-auto_update   = false          # opt-in: downloads + replaces binaries
+version_check = true           # on by default: makes a network call
+auto_update   = true           # on by default: downloads + replaces binaries
 
 [notifications]
 backend             = "auto"   # auto / dbus / windows / off
@@ -403,9 +403,8 @@ min_interval_secs   = 5        # per-session floor between notifications</code><
           <h3><code>[features]</code> &mdash; whole-feature switches</h3>
           <p>
             Turn major TUI features off entirely. All default to
-            <code>true</code>
-            <strong>except <code>version_check</code> and <code>auto_update</code>, which default to <code>false</code></strong>
-            (both reach the network, so they are opt-in). The UI-panel feature flags
+            <code>true</code>, including <code>version_check</code> and <code>auto_update</code>,
+            which both reach the network. The UI-panel feature flags
             (<code>tasks</code>, <code>file_viewer</code>, <code>info_panel</code>,
             <code>global_search</code>, <code>shell_pane</code>, <code>code_review</code>,
             <code>soft_delete</code>) are <strong>live-reloaded</strong> &mdash; they take effect
@@ -480,7 +479,7 @@ min_interval_secs   = 5        # per-session floor between notifications</code><
               </tr>
               <tr>
                 <td><code>version_check</code></td>
-                <td><code>false</code></td>
+                <td><code>true</code></td>
                 <td>
                   GitHub update check: TUI header &ldquo;update available&rdquo; badge +
                   <code>friring-cli version --check</code>
@@ -488,7 +487,7 @@ min_interval_secs   = 5        # per-session floor between notifications</code><
               </tr>
               <tr>
                 <td><code>auto_update</code></td>
-                <td><code>false</code></td>
+                <td><code>true</code></td>
                 <td>
                   silent self-update: download + verify + replace the binaries on startup +
                   <code>friring-cli update</code>
@@ -509,7 +508,7 @@ min_interval_secs   = 5        # per-session floor between notifications</code><
             no-ops every transition; the session status display itself is unaffected.
           </p>
           <p>
-            <code>version_check = true</code>
+            <code>version_check</code> (on by default)
             enables the update check. On launch the TUI reads a cached result
             (<code>~/.local/share/friring/version-check.json</code>) and, if it is older than 24&nbsp;h,
             fires a single best-effort background fetch of GitHub's latest release (via
@@ -521,7 +520,7 @@ min_interval_secs   = 5        # per-session floor between notifications</code><
             (<code>friring-cli version</code> with no flag always prints the current version).
           </p>
           <p>
-            <code>auto_update = true</code>
+            <code>auto_update</code> (on by default)
             goes a step further than <code>version_check</code>: instead of just showing a badge, the
             TUI <strong>silently updates itself</strong> on startup. After the same 24&nbsp;h cache
             check, if a newer release exists it downloads that release's tarball + checksums from
@@ -536,8 +535,9 @@ min_interval_secs   = 5        # per-session floor between notifications</code><
             <code>friring-cli update</code>
             performs the same update on demand (<code>--force</code> bypasses the up-to-date and
             dev-build guards); dev builds (<code>0.0.0-dev</code>) never auto-update.
-            <code>version_check</code> and <code>auto_update</code> are independent &mdash; enable
-            either or both.
+            <code>version_check</code> and <code>auto_update</code> are independent &mdash; set
+            either to <code>false</code> to make no network call or to keep friring from replacing
+            its own binary.
           </p>
 
           <h3 id="notifications"><code>[notifications]</code> &mdash; OS notification settings</h3>
