@@ -2025,8 +2025,17 @@ column nullable so pre-v44 rows keep their exact old behavior):
   900 s) — the whole process group, not just the shell, since a backgrounded
   worker would otherwise outlive the deadline while holding the pipes open —
   with output drained to a bounded tail on separate threads, and a
-  `running` row orphaned by a crash is reaped — on the next startup and on every
-  headless tick — once it outlives its own command's timeout.
+  `running` row orphaned by a crash is reaped — on every TUI automation pass and
+  every headless tick — once it outlives its own command's timeout. Upstream
+  later moved Exec off the tick thread too
+  ([`0f5da348`](https://github.com/Thurbeen/thurbox/commit/0f5da348), by letur);
+  two blind judges preferred the fork's runner, and two ideas were ported from
+  upstream's. First, a fire whose previous run is still going records a skip
+  rather than starting a second copy. Upstream tracks that in an in-memory set
+  in the TUI; the fork checks the run table in the insert itself, so the guard
+  also holds across the headless tick, a second instance and a restart.
+  Second, the command gets no stdin, as upstream's `Command::output()` implies,
+  so a read can no longer stop it with `SIGTTIN` until the deadline.
 - **The editor reaches the whole model.** Upstream's editor exposes repo /
   worktree / agent as free text and can't set a base branch, extra repos, a
   host, a session mode or an exec timeout at all. The fork makes **agent** and

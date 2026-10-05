@@ -149,7 +149,13 @@ pub fn run_exec_command_with_timeout(
         c.args(["-c", command]);
         c
     };
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // No stdin: the inherited one is the TUI's terminal (or the keeper's), and
+    // from its own process group below a read there stops the job with
+    // SIGTTIN until the deadline kills it; a pipe left open by the caller
+    // would block it just the same.
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     // Put the child in its own process group so the deadline can kill the whole
     // tree, not just the shell. `sh -c 'worker & wait'` otherwise survives:
     // killing `sh` alone leaves the grandchild running *and* holding the pipe
@@ -1184,6 +1190,42 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(15),
             "deadline overran: {elapsed:?}"
+        );
+    }
+
+    /// In the TUI the inherited stdin is the terminal, where a read from the
+    /// job's own process group stops it with SIGTTIN until the deadline. A pipe
+    /// whose write end stays open blocks a reader the same way, and stands in
+    /// for the terminal because the harness's stdin may already be `/dev/null`.
+    #[cfg(unix)]
+    #[test]
+    fn run_exec_command_does_not_read_the_callers_stdin() {
+        let mut fds = [0; 2];
+        // SAFETY: plain fd syscalls on descriptors this test owns; fd 0 is
+        // restored before any assertion can unwind.
+        let saved = unsafe {
+            assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+            let saved = libc::dup(0);
+            assert!(saved >= 0);
+            assert_eq!(libc::dup2(fds[0], 0), 0);
+            saved
+        };
+
+        let started = std::time::Instant::now();
+        let (status, detail) = run_exec_command_with_timeout("cat", Some(5));
+        let elapsed = started.elapsed();
+
+        // SAFETY: as above.
+        unsafe {
+            libc::dup2(saved, 0);
+            libc::close(saved);
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+        assert_eq!(status, AutomationRunStatus::Success, "got {detail}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(4),
+            "took {elapsed:?}"
         );
     }
 

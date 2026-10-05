@@ -345,6 +345,10 @@ pub enum AutomationAction {
 /// before the async move, the whole render loop) forever.
 pub const DEFAULT_EXEC_TIMEOUT_SECS: u64 = 900;
 
+/// Run-history detail of an `Exec` fire skipped because the automation's
+/// previous run is still going (`Database::begin_exec_run`).
+pub const EXEC_OVERLAP_SKIP_DETAIL: &str = "previous run still in flight";
+
 impl AutomationAction {
     /// Storage discriminant (`action_kind` column).
     pub fn kind(&self) -> &'static str {

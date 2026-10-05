@@ -15187,6 +15187,37 @@ mod tests {
         );
     }
 
+    /// The TUI's Exec fire honours the same overlap guard as `automation tick`:
+    /// with the previous run still live it records a skip instead of starting
+    /// a second copy of the command.
+    #[test]
+    fn exec_fire_skips_while_its_previous_run_is_live() {
+        let mut app = app_with_sessions(0);
+        let new = crate::storage::automations::NewAutomation {
+            name: "sync".into(),
+            enabled: true,
+            schedule: crate::session::AutomationSchedule::Once { at: 1 },
+            timezone: None,
+            action: crate::session::AutomationAction::Exec {
+                command: "true".into(),
+                timeout_secs: None,
+            },
+            prompt: String::new(),
+            next_run_at: Some(1),
+            prompt_steps: Vec::new(),
+        };
+        let id = app.db.create_automation(&new).unwrap();
+        let live = app.db.begin_exec_run(id, "true").unwrap().unwrap();
+
+        app.process_automations(true);
+
+        let runs = app.db.list_automation_runs(id, 10).unwrap();
+        assert_eq!(runs.len(), 2, "got {runs:?}");
+        assert_eq!(runs[0].status, AutomationRunStatus::Skipped);
+        assert_eq!(runs[1].id, live);
+        assert_eq!(runs[1].status, AutomationRunStatus::Running);
+    }
+
     #[test]
     fn global_search_matches_task_description() {
         let mut app = app_with_sessions(1);
