@@ -1932,6 +1932,15 @@ flow away. The fork rebuilds the flow:
   palette returns exactly as left; branch load + origin fetch re-dispatch per
   ADR-P12). First step cancels; the agent picker with a worktree create in
   flight and a fork stay full cancels.
+- **One flow at a time while a worktree is created.** Upstream added a
+  re-entry guard with its new-session progress row
+  ([`c1ab2853`](https://github.com/Thurbeen/thurbox/commit/c1ab2853), by
+  letur), refusing a new wizard while its branch listing or worktree create
+  runs. The fork guards the worktree create only (its branch listing runs
+  under the open branch selector, which owns every key) but covers every entry
+  that stages wizard state: `Ctrl+N`, a task's spawn-new, fork, and
+  conversation import. A task's prompt is staged after the check, so a refused
+  task spawn leaves the in-flight flow's prompt alone instead of clearing it.
 - **Wizard chrome + name prefill.** Every step is titled `New Session — <step>`
   (fork/import variants say so), the name/branch/agent steps show a muted
   breadcrumb of accumulated choices, and the session name is prefilled from

@@ -323,6 +323,9 @@ impl App {
     /// the relaunch agent, kick the off-thread scan, and show the modal in its
     /// loading state. [`Self::poll_conversation_import`] fills it in.
     pub(super) fn start_conversation_import(&mut self) {
+        if self.refuse_new_session_in_flight() {
+            return;
+        }
         let Some(agent) = self.resume_capable_agent() else {
             self.set_error(
                 "No agent in agents.toml can resume by id (needs resume_args with {id})",
@@ -334,7 +337,7 @@ impl App {
             return;
         };
         // An import is always local and parentless — clear anything a
-        // cancelled wizard/fork/task flow left behind (mirrors `act_new_session`).
+        // cancelled wizard/fork/task flow left behind (mirrors `start_new_session`).
         self.new_session.backend = None;
         self.new_session.parent_session_id = None;
         self.new_session.saved_repo_picker = None;

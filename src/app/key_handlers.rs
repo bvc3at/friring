@@ -796,8 +796,7 @@ impl App {
                 // lands. Going through the wizard entry also clears a backend
                 // left over from a previously cancelled remote flow, which
                 // would otherwise silently make this picker remote.
-                self.task_ui.pending_task_prompt = Some((task_id, title));
-                self.start_new_session();
+                self.start_new_session(Some((task_id, title)));
             }
         }
     }
@@ -2083,11 +2082,7 @@ impl App {
         ) {
             self.new_automation_in_pane();
         } else {
-            // A manual new-session must not inherit a task prompt or fork
-            // parenthood left over from a cancelled task-spawn / fork.
-            self.task_ui.pending_task_prompt = None;
-            self.new_session.parent_session_id = None;
-            self.start_new_session();
+            self.start_new_session(None);
         }
     }
 
