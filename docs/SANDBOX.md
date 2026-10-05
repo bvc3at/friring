@@ -2867,12 +2867,13 @@ mode the chosen backend cannot enforce.
 directory selection so it can rank profiles covering the chosen directories
 first and label the ones that do not. Every profile stays selectable: the wizard
 knows the launch cwd, not what the user intends to reach from it. The step shows
-each profile's resolved backend and the reason it is unavailable when it is,
-is skipped entirely when no profile exists,
-keeps its choice in the wizard state, contributes a breadcrumb line, and steps
-back to the repo palette (Esc from the name modal returns to it with the
-previous answer selected). *Create a sandbox for this selection* with pre-filled
-paths is not built yet — the step offers the stored profiles and `none`.
+each profile's resolved backend and the reason it is unavailable when it is, is
+skipped entirely when no profile exists, keeps its choice in the wizard state —
+read only by the spawn that completes the wizard, never by an automation or task
+spawn firing meanwhile — contributes a breadcrumb line, and steps back to the
+repo palette (Esc from the name modal returns to it with the previous answer
+selected). *Create a sandbox for this selection* with pre-filled paths is not
+built yet — the step offers the stored profiles and `none`.
 
 **Place-backed sessions** are marked by their backend rather than by a second
 indicator: `backend_type` is `sandbox:<profile>`, and a place that is not running

@@ -329,7 +329,7 @@ already brought up and is cheap on the main thread.
 - *An ssh `ConnectTimeout` default* — caps the down-host case but does nothing
   for a reachable-but-slow host, and silently changes user ssh behavior.
 - *Adopting on the background thread too* — `restore_single_session` mutates
-  `App` (session list, wizard state on the respawn path); shipping a built
+  `App` (session list, persisted rows on the respawn path); shipping a built
   `Session` across the channel would split that invariant for no measured win.
 
 ---
