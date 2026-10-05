@@ -15,6 +15,7 @@
 // (upstream pi uses `ask_user_question`). We treat BOTH as blocking so the dot
 // turns red while OMP waits for the user instead of staying yellow (working).
 import { exec } from "node:child_process";
+import { appendFileSync } from "node:fs";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
 // Tool names that block the turn until the user answers.
@@ -25,9 +26,23 @@ const BLOCKING_TOOLS = new Set(["ask", "ask_user_question"]);
 // remote host). Do not split the words across lines or reorder the flags.
 const SIGNAL = "friring-cli session signal --state ";
 
-// Fire-and-forget; the callback swallows errors so a hook never surfaces into
-// the agent. exec inherits the OMP process env, so $FRIRING_SESSION travels.
+// Fire-and-forget; errors are swallowed so a hook never surfaces into the
+// agent. exec inherits the OMP process env, so $FRIRING_SESSION travels.
+//
+// Inside a sandbox that binary need not exist, and the database it writes is
+// out of reach by design (docs/SANDBOX.md ADR-29). friring then exports
+// $FRIRING_SIGNAL_FILE and polls it, so the state is appended there instead —
+// one O_APPEND write per event, so two events never tear each other.
 const report = (state: string): void => {
+  const file = process.env.FRIRING_SIGNAL_FILE;
+  if (file) {
+    try {
+      appendFileSync(file, `${state}\n`);
+    } catch {
+      // best-effort: never surface hook errors into the agent
+    }
+    return;
+  }
   exec(SIGNAL + state, () => {});
 };
 
