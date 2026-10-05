@@ -552,6 +552,15 @@ Now the flow overlaps everything with the user's own think-time:
   cancelled): whichever of {user picks, worker delivers} finishes last
   triggers the spawn. A cancel (Esc) drops the delivered worktrees exactly
   like a cancel after creation always did.
+- **One flow at a time until the create lands.** After the agent pick the
+  wizard is closed, yet its spawn still reads what the wizard staged (sandbox
+  profile, parent, task prompt) when the worker delivers. Every new-session
+  entry (`Ctrl+N`, a task's spawn-new, fork, conversation import) is refused
+  meanwhile (`App::new_session_in_flight`), and programmatic spawns
+  (automations, tasks, respawns) carry their own `SpawnStaging` rather than
+  reading the wizard's. Gates:
+  `new_session_flows_are_refused_while_a_worktree_create_is_in_flight`,
+  `programmatic_spawn_leaves_the_wizard_staging_alone`.
 - **Backend readiness + repo display names move into the async spawn
   worker** (`ensure_backend_ready`, `session_member_dirs`-derived names), so
   the picker's `Enter` and the adopt tick no longer shell out.

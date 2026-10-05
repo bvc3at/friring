@@ -2014,13 +2014,48 @@ impl App {
             })
     }
 
+    /// Whether an earlier new-session flow is still creating its worktrees.
+    /// That flow's spawn reads what its wizard staged (sandbox profile, parent,
+    /// task prompt) only once the create lands, so a second flow started
+    /// meanwhile would reset or overwrite it — the first session then launched
+    /// without the sandbox the user picked. The branch listing needs no such
+    /// guard: it runs under the open branch selector, which owns every key,
+    /// and a spawn already handed to its worker carries its own copy.
+    fn new_session_in_flight(&self) -> bool {
+        self.worktree_create.in_progress()
+    }
+
+    /// Refuse to start another new-session flow (wizard, fork, import) while
+    /// [`Self::new_session_in_flight`], saying why. Entry points call this
+    /// before staging anything: what is staged at that moment belongs to the
+    /// flow in flight.
+    fn refuse_new_session_in_flight(&mut self) -> bool {
+        if !self.new_session_in_flight() {
+            return false;
+        }
+        self.set_info("Already creating a session — try again in a moment");
+        true
+    }
+
     /// Entry point for the new-session wizard.
     ///
     /// When any off-local host is available — a configured SSH/WSL host
     /// (`hosts.toml`) or an auto-discovered WSL distro — first shows the host
     /// picker so the user can choose where the session runs; otherwise goes
     /// straight to the repo picker (preserving the local-only UX).
-    pub(crate) fn start_new_session(&mut self) {
+    ///
+    /// `task_prompt` is a task spawn's `(task_id, title)`, delivered once the
+    /// session lands; a manual new session passes `None`. It is staged here,
+    /// after the in-flight check, so a refused entry never overwrites the
+    /// prompt of the flow it was refused for.
+    pub(crate) fn start_new_session(&mut self, task_prompt: Option<(i64, String)>) {
+        if self.refuse_new_session_in_flight() {
+            return;
+        }
+        // A manual new session must not inherit a task prompt or fork
+        // parenthood left over from a cancelled task spawn / fork.
+        self.task_ui.pending_task_prompt = task_prompt;
+        self.new_session.parent_session_id = None;
         // Clear any choice left over from a previously cancelled flow.
         self.new_session.backend = None;
         self.new_session.workspace_dir = None;
@@ -2856,6 +2891,9 @@ impl App {
     }
 
     fn fork_active_session(&mut self) {
+        if self.refuse_new_session_in_flight() {
+            return;
+        }
         let Some(session) = self.sessions.get(self.active_index) else {
             return;
         };
@@ -11162,7 +11200,7 @@ mod tests {
     #[test]
     fn start_new_session_skips_host_picker_when_no_hosts() {
         let mut app = app_with_sessions(0);
-        app.start_new_session();
+        app.start_new_session(None);
         // No hosts configured → straight to the repo picker, no host step.
         assert!(matches!(app.modal, modals::Modal::RepoPicker(_)));
         assert!(app.new_session.backend.is_none());
@@ -11182,7 +11220,7 @@ mod tests {
                 crate::session::HostDef::wsl("Ubuntu"),
             ],
         });
-        app.start_new_session();
+        app.start_new_session(None);
         match app.modal {
             modals::Modal::HostPicker(ref hp) => {
                 // "local" first, then each off-local host (ssh + wsl).
@@ -13473,7 +13511,7 @@ mod tests {
     #[test]
     fn click_repo_picker_row_toggles_not_confirms() {
         let mut app = app_with_sessions(0);
-        app.start_new_session(); // no hosts → opens the repo picker
+        app.start_new_session(None); // no hosts → opens the repo picker
         let modals::Modal::RepoPicker(ref mut rp) = app.modal else {
             panic!("expected repo picker");
         };
@@ -13503,7 +13541,7 @@ mod tests {
     /// repos + the pinned "start here" row, dropping any machine-dependent
     /// first-run import suggestions.
     fn seeded_repo_picker(app: &mut App, repos: &[&str]) {
-        app.start_new_session();
+        app.start_new_session(None);
         let modals::Modal::RepoPicker(ref mut rp) = app.modal else {
             panic!("expected repo picker");
         };
@@ -13587,7 +13625,7 @@ mod tests {
         app.db
             .upsert_repo_bookmark("", std::path::Path::new("/tmp/zzz"))
             .unwrap();
-        app.start_new_session();
+        app.start_new_session(None);
 
         // With text in the input, Delete is forward-delete, not "forget".
         app.handle_key(KeyCode::Char('z'), KeyModifiers::NONE);
@@ -13702,7 +13740,7 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("repo1").join(".git")).unwrap();
 
         let mut app = app_with_sessions(0);
-        app.start_new_session();
+        app.start_new_session(None);
         {
             let modals::Modal::RepoPicker(ref mut rp) = app.modal else {
                 panic!("expected repo picker");
@@ -14637,7 +14675,7 @@ mod tests {
     #[test]
     fn click_inside_repo_picker_chrome_is_swallowed() {
         let mut app = app_with_sessions(0);
-        app.start_new_session(); // no hosts → opens the repo palette
+        app.start_new_session(None); // no hosts → opens the repo palette
         let backend = ratatui::backend::TestBackend::new(120, 30);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal.draw(|f| app.view(f)).unwrap();
@@ -18508,6 +18546,63 @@ mod tests {
         assert!(app.pending_worktree_create.is_none());
     }
 
+    /// After the agent pick the wizard is closed but its worktree is still
+    /// being created, and that flow's spawn reads its staged sandbox profile,
+    /// parent and task prompt only once the create lands. A second new-session
+    /// flow started in that gap reset them, so the first session launched on
+    /// the host. Every entry point is refused until the create finishes.
+    #[test]
+    fn new_session_flows_are_refused_while_a_worktree_create_is_in_flight() {
+        let mut app = app_with_sessions(1);
+        let parent = app.sessions[0].info.id;
+        app.new_session.sandbox_profile = Some("strict".into());
+        app.new_session.parent_session_id = Some(parent);
+        app.task_ui.pending_task_prompt = Some((7, "ship it".into()));
+        let tx = app.worktree_create.start();
+        app.pending_worktree_create = Some(PendingWorktreeCreate {
+            backend: None,
+            normal_repos: vec![],
+            session_name: Some("sess".into()),
+            base_branch: "main".into(),
+            agent_pick: AgentPick::NotOpened,
+        });
+
+        let staged_intact = |app: &App, entry: &str| {
+            assert!(matches!(app.modal, modals::Modal::None), "{entry} opened");
+            assert!(!app.new_session.fork, "{entry}");
+            assert_eq!(
+                app.new_session.sandbox_profile.as_deref(),
+                Some("strict"),
+                "{entry}"
+            );
+            assert_eq!(app.new_session.parent_session_id, Some(parent), "{entry}");
+            assert_eq!(
+                app.task_ui.pending_task_prompt,
+                Some((7, "ship it".to_string())),
+                "{entry}"
+            );
+            assert_eq!(
+                app.status_message.as_ref().map(|m| m.text.as_str()),
+                Some("Already creating a session — try again in a moment"),
+                "{entry}"
+            );
+        };
+        app.dispatch_action(crate::session::Action::NewSession);
+        staged_intact(&app, "Ctrl+N");
+        app.start_new_session(Some((8, "another task".into())));
+        staged_intact(&app, "task spawn");
+        app.dispatch_action(crate::session::Action::ForkSession);
+        staged_intact(&app, "fork");
+        app.start_conversation_import();
+        staged_intact(&app, "import");
+
+        // Once the create is over, the wizard opens again.
+        drop(tx);
+        app.poll_worktree_create();
+        app.dispatch_action(crate::session::Action::NewSession);
+        assert!(matches!(app.modal, modals::Modal::RepoPicker(_)));
+    }
+
     #[test]
     fn note_slow_op_applies_record_threshold() {
         let mut app = app_with_sessions(0);
@@ -20572,7 +20667,7 @@ mod tests {
             ..Default::default()
         });
 
-        app.start_new_session();
+        app.start_new_session(None);
         assert!(matches!(app.modal, modals::Modal::HostPicker(_)));
         // Pick the remote host → the palette opens for that host. The host
         // picker is type-to-filter now (upstream #9), so navigate with ↓, not
@@ -20789,7 +20884,7 @@ mod tests {
             Some(Box::new(cc_import::ConversationPickerModal::default()));
 
         // A fresh flow must not resurrect last flow's parked state.
-        app.start_new_session();
+        app.start_new_session(None);
         assert!(app.new_session.saved_repo_picker.is_none());
         assert!(app.new_session.saved_conversation_picker.is_none());
 
