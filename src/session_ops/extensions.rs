@@ -515,10 +515,12 @@ pub fn install_extension(
     // 3. Agents → agents.toml (idempotent), from the **home-resolved** manifest.
     //
     // Resolved here rather than only at step 4: an agent's `command` may be
-    // `{home}/bin/x`, and `agents.toml` is read by the launcher, which expands
-    // no tokens. Registered unresolved, every launch of that agent dies with
-    // `cannot run '{home}/bin/x'` — which is what both of this fork's
-    // bridge-backed extensions declare, so neither could start at all.
+    // `{home}/bin/x`, and the launcher reading `agents.toml` expands `{home}`
+    // only as the launch target's home directory
+    // (`session_ops::expand_home_in_def`, for a session-path agent like the
+    // built-in `omp`), never as the extension's. Registered unresolved, every
+    // launch of that agent would run `~/bin/x` instead — which is what both of
+    // this fork's bridge-backed extensions declare, so neither could start.
     let resolved = def
         .resolved_for_home(&home_str, crate::paths::home_dir().as_deref())
         .with_provenance(current, target);
@@ -2074,11 +2076,13 @@ on_conflict = "refuse"
 
     /// An agent whose `command` is `{home}/…` reaches `agents.toml` **resolved**.
     ///
-    /// `agents.toml` is read by the launcher, which expands no tokens: an entry
-    /// carrying the literal makes every launch of that agent die with `cannot
-    /// run '{home}/bin/x'`. Both of this fork's bridge-backed extensions declare
-    /// their agents that way, so registering before resolving meant neither
-    /// could start — which manifest-linting them could not have shown.
+    /// The launcher expands `{home}` in `agents.toml` only as the launch
+    /// target's home directory, so an entry carrying the literal would run
+    /// `~/bin/x` instead of the extension's `bin/x`. Both of this fork's
+    /// bridge-backed extensions declare their agents that way, so registering
+    /// before resolving meant neither could start — which manifest-linting them
+    /// could not have shown. Only the extension's own entry is checked: the
+    /// seeded built-in `omp` carries a spawn-time `{home}` on purpose.
     #[test]
     fn an_agent_command_under_the_extension_home_is_registered_resolved() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -2114,9 +2118,13 @@ args = ["{{home}}/lib/thing"]
 
         let agents = crate::agent::agent_config::agents_config_path().unwrap();
         let text = std::fs::read_to_string(&agents).unwrap();
+        let registry: crate::session::AgentRegistry = toml::from_str(&text).unwrap();
+        let agent = registry
+            .get("tokened-agent")
+            .expect("the extension's agent is registered");
         assert!(
-            !text.contains("{home}"),
-            "agents.toml carries an unresolved token:\n{text}"
+            !agent.command.contains("{home}") && agent.args.iter().all(|a| !a.contains("{home}")),
+            "the extension's agent carries an unresolved token:\n{text}"
         );
         assert!(
             text.contains(&format!("{}/bin/run.sh", home.display())),
