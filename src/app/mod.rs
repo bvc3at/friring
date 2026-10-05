@@ -217,6 +217,25 @@ fn finalize_launch_provider(
     (Arc::new(GenericProvider::new(def)), degraded)
 }
 
+/// What a spawn consumes besides its [`SessionConfig`] and worktrees. The
+/// new-session wizard stages these on `new_session` / `task_ui` across several
+/// modals and hands them over with [`App::take_wizard_staging`]; programmatic
+/// spawns (automations, tasks, respawns) build their own. When every spawn read
+/// the wizard's fields, an automation firing mid-wizard took the user's
+/// choices — the sandbox profile included, so the wizard's session then
+/// launched on the host.
+#[derive(Default)]
+pub(crate) struct SpawnStaging {
+    additional_dirs: Vec<PathBuf>,
+    workspace_dir: Option<PathBuf>,
+    parent_session_id: Option<SessionId>,
+    base_branch: Option<String>,
+    /// The wizard's sandbox step; ignored when the config already carries a
+    /// sandbox (a respawn re-applying its stored profile).
+    sandbox_profile: Option<String>,
+    task_prompt: Option<(i64, String)>,
+}
+
 /// Continuation for a backgrounded interactive `Session::spawn`: the metadata
 /// and follow-up actions applied once the session is live (in
 /// [`App::poll_session_spawn`]).
@@ -5376,6 +5395,7 @@ impl App {
         worktrees: &[WorktreeInfo],
         additional_dirs: &[PathBuf],
         workspace_dir: Option<PathBuf>,
+        sandbox_profile: Option<String>,
     ) -> Option<SpawnInputs> {
         let (rows, cols) = self.content_area_size();
 
@@ -5406,8 +5426,7 @@ impl App {
         // here rather than carried as a profile so a spawn always applies what
         // storage holds *now* — the editor may have been open in between.
         if config.sandbox.is_none() {
-            let chosen = self.new_session.sandbox_profile.take();
-            match self.load_session_sandbox(chosen.as_deref()) {
+            match self.load_session_sandbox(sandbox_profile.as_deref()) {
                 Ok(profile) => config.sandbox = profile,
                 Err(message) => {
                     self.set_error(message);
@@ -5565,14 +5584,24 @@ impl App {
         name: String,
         config: &SessionConfig,
         worktrees: Vec<WorktreeInfo>,
+        staging: SpawnStaging,
     ) {
-        let additional_dirs = std::mem::take(&mut self.new_session.additional_dirs);
-        let workspace_dir = self.new_session.workspace_dir.take();
-        let parent_session_id = self.new_session.parent_session_id.take();
-        let base_branch = self.new_session.spawn_base_branch.take();
-        let Some(inputs) =
-            self.build_spawn_inputs(&name, config, &worktrees, &additional_dirs, workspace_dir)
-        else {
+        let SpawnStaging {
+            additional_dirs,
+            workspace_dir,
+            parent_session_id,
+            base_branch,
+            sandbox_profile,
+            task_prompt,
+        } = staging;
+        let Some(inputs) = self.build_spawn_inputs(
+            &name,
+            config,
+            &worktrees,
+            &additional_dirs,
+            workspace_dir,
+            sandbox_profile,
+        ) else {
             return;
         };
         // This path is synchronous by contract (its callers need the session id
@@ -5600,7 +5629,6 @@ impl App {
         ) {
             Ok(mut session) => {
                 session.info.hook_wiring = hook_wiring;
-                let task_prompt = self.task_ui.pending_task_prompt.take();
                 self.finalize_spawned_session(
                     session,
                     inputs.primary_cwd,
@@ -5616,6 +5644,19 @@ impl App {
                 error!("Failed to spawn session: {e}");
                 self.set_error(format!("Failed to start {}: {e:#}", inputs.config.agent));
             }
+        }
+    }
+
+    /// Hand everything the wizard staged to the spawn that completes it, so
+    /// none of it is left over for the next spawn.
+    fn take_wizard_staging(&mut self) -> SpawnStaging {
+        SpawnStaging {
+            additional_dirs: std::mem::take(&mut self.new_session.additional_dirs),
+            workspace_dir: self.new_session.workspace_dir.take(),
+            parent_session_id: self.new_session.parent_session_id.take(),
+            base_branch: self.new_session.spawn_base_branch.take(),
+            sandbox_profile: self.new_session.sandbox_profile.take(),
+            task_prompt: self.task_ui.pending_task_prompt.take(),
         }
     }
 
@@ -5635,21 +5676,30 @@ impl App {
         self.new_session.saved_repo_picker = None;
         self.new_session.saved_conversation_picker = None;
 
+        let staging = self.take_wizard_staging();
         if self.session_spawn.in_progress() {
-            self.do_spawn_session(name, config, worktrees);
+            self.do_spawn_session(name, config, worktrees, staging);
             return;
         }
 
-        let additional_dirs = std::mem::take(&mut self.new_session.additional_dirs);
-        let workspace_dir = self.new_session.workspace_dir.take();
-        let parent_session_id = self.new_session.parent_session_id.take();
-        let base_branch = self.new_session.spawn_base_branch.take();
-        let Some(inputs) =
-            self.build_spawn_inputs(&name, config, &worktrees, &additional_dirs, workspace_dir)
-        else {
+        let SpawnStaging {
+            additional_dirs,
+            workspace_dir,
+            parent_session_id,
+            base_branch,
+            sandbox_profile,
+            task_prompt,
+        } = staging;
+        let Some(inputs) = self.build_spawn_inputs(
+            &name,
+            config,
+            &worktrees,
+            &additional_dirs,
+            workspace_dir,
+            sandbox_profile,
+        ) else {
             return;
         };
-        let task_prompt = self.task_ui.pending_task_prompt.take();
 
         let SpawnInputs {
             config,
@@ -9719,16 +9769,19 @@ impl App {
         let def = self.agent_def_for(&config.agent);
         config.resume_session_id =
             crate::session_ops::resume_trigger_for(&def, &agent_session_id, &config.env);
-        self.new_session.additional_dirs = shared.additional_dirs;
-        self.new_session.workspace_dir = shared.workspace_dir;
-        self.new_session.parent_session_id = shared.parent_session_id;
+        let staging = SpawnStaging {
+            additional_dirs: shared.additional_dirs,
+            workspace_dir: shared.workspace_dir,
+            parent_session_id: shared.parent_session_id,
+            ..SpawnStaging::default()
+        };
         // After a reboot every session takes this path (the tmux server died),
         // so the manual list position must survive the respawn or one restart
         // would scramble the whole order. `do_spawn_session` pushes + persists
         // the fresh session; stamp the inherited order on it afterwards.
         let display_order = shared.display_order;
         let before = self.sessions.len();
-        self.do_spawn_session(name, &config, worktrees);
+        self.do_spawn_session(name, &config, worktrees, staging);
         if self.sessions.len() > before && display_order.is_some() {
             if let Some(session) = self.sessions.last_mut() {
                 session.info.display_order = display_order;
@@ -9935,8 +9988,11 @@ impl App {
             config.agent = a.to_string();
         }
 
-        self.new_session.additional_dirs = additional_dirs;
-        self.do_spawn_session(name.clone(), &config, worktrees);
+        let staging = SpawnStaging {
+            additional_dirs,
+            ..SpawnStaging::default()
+        };
+        self.do_spawn_session(name.clone(), &config, worktrees, staging);
         let session = self
             .sessions
             .iter()
@@ -11636,7 +11692,7 @@ mod tests {
         let mut app = App::new(24, 80, stub_backend(), agents, test_db());
 
         let inputs = app
-            .build_spawn_inputs("s", &SessionConfig::default(), &[], &[], None)
+            .build_spawn_inputs("s", &SessionConfig::default(), &[], &[], None, None)
             .expect("local spawn inputs");
 
         let sid = inputs.config.agent_session_id.as_deref().unwrap();
@@ -13992,6 +14048,41 @@ mod tests {
         assert!(err.contains("tb-deploy_bot"), "got {err}");
         assert!(err.contains("deploy bot"), "names the holder: {err}");
         assert_eq!(app.sessions.len(), 1, "nothing was spawned");
+    }
+
+    /// An automation firing while the user is mid-wizard must not consume what
+    /// the wizard staged — above all its sandbox profile, whose loss would
+    /// launch the wizard's session on the host.
+    #[test]
+    fn programmatic_spawn_leaves_the_wizard_staging_alone() {
+        let mut app = app_with_sessions(0);
+        let parent = SessionId::default();
+        app.new_session.sandbox_profile = Some("strict".into());
+        app.new_session.workspace_dir = Some(PathBuf::from("/ws"));
+        app.new_session.parent_session_id = Some(parent);
+        app.new_session.spawn_base_branch = Some("main".into());
+        app.task_ui.pending_task_prompt = Some((7, "ship it".into()));
+
+        // The stub backend refuses to spawn, so this fails after staging is read.
+        let _ = app.spawn_and_prompt(SpawnPromptRequest {
+            name: "auto-1".into(),
+            repo_path: std::path::Path::new("/tmp"),
+            worktree_branch: None,
+            base_branch: None,
+            agent: None,
+            host: None,
+            extra_repos: &[],
+            steps: &[crate::session::PromptStep::new("go")],
+        });
+
+        assert_eq!(app.new_session.sandbox_profile.as_deref(), Some("strict"));
+        assert_eq!(app.new_session.workspace_dir, Some(PathBuf::from("/ws")));
+        assert_eq!(app.new_session.parent_session_id, Some(parent));
+        assert_eq!(app.new_session.spawn_base_branch.as_deref(), Some("main"));
+        assert_eq!(
+            app.task_ui.pending_task_prompt,
+            Some((7, "ship it".to_string()))
+        );
     }
 
     /// Undelete must not resurrect a name whose tmux window a session created
