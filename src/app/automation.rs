@@ -28,15 +28,15 @@ impl App {
         if !force && self.metrics.tick_count % 100 != 0 {
             return;
         }
-        if force {
-            // A `Running` exec row whose worker died with the previous process
-            // would otherwise show as running forever. The startup pass is the
-            // only moment we know no worker of ours owns one.
-            match self.db.reap_orphaned_automation_runs() {
-                Ok(n) if n > 0 => info!("Closed {n} automation run(s) left running by a crash"),
-                Ok(_) => {}
-                Err(e) => error!("Failed to reap orphaned automation runs: {e}"),
-            }
+        // A `Running` exec row whose worker died with its process (an earlier
+        // TUI, or a headless `tick` killed mid-command) would otherwise show as
+        // running until the next startup. The reaper's per-run cutoff (the
+        // run's own timeout plus a grace) never reaches a row a live worker
+        // still owns, so it runs on every pass, not only at startup.
+        match self.db.reap_orphaned_automation_runs() {
+            Ok(n) if n > 0 => info!("Closed {n} automation run(s) left running by a crash"),
+            Ok(_) => {}
+            Err(e) => error!("Failed to reap orphaned automation runs: {e}"),
         }
         let now = crate::sync::current_time_millis();
         let due = match self.db.due_automations(now) {
@@ -219,17 +219,26 @@ impl App {
 
     /// Start an `Exec` automation off the tick thread: record a `Running` row,
     /// then run the command on a worker that closes the row out when it exits.
+    /// While the automation's previous run is still going, record a `Skipped`
+    /// run instead (`Database::begin_exec_run`).
     ///
     /// The worker opens its own database connection — `App::db` is not shared
     /// across threads, and the run outlives this tick either way.
     fn fire_exec_async(&mut self, automation_id: i64, command: &str, timeout_secs: Option<u64>) {
-        let run_id = match self.db.record_automation_run(
-            automation_id,
-            AutomationRunStatus::Running,
-            command,
-            None,
-        ) {
-            Ok(id) => id,
+        let run_id = match self.db.begin_exec_run(automation_id, command) {
+            Ok(Some(id)) => id,
+            Ok(None) => {
+                info!("Automation {automation_id} skipped: its previous run is still in flight");
+                if let Err(e) = self.db.record_automation_run(
+                    automation_id,
+                    AutomationRunStatus::Skipped,
+                    crate::session::automation::EXEC_OVERLAP_SKIP_DETAIL,
+                    None,
+                ) {
+                    error!("Failed to record run for automation {automation_id}: {e}");
+                }
+                return;
+            }
             Err(e) => {
                 error!("Failed to record run for automation {automation_id}: {e}");
                 return;

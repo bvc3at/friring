@@ -317,7 +317,8 @@ when `tick()` polls `try_recv()`:
   result has to reach the model. (The headless `automation tick` runs it
   inline instead — a short-lived process that detached would exit and
   strand the row.) A worker that dies with its process is recovered by
-  `reap_orphaned_automation_runs`; see `docs/FEATURES.md`.
+  `reap_orphaned_automation_runs`, and a fire whose previous run is still
+  live records a skip (`Database::begin_exec_run`); see `docs/FEATURES.md`.
 
 **Rejected**:
 

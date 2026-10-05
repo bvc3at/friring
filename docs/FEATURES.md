@@ -1771,11 +1771,23 @@ so a descendant that escapes the group still cannot pin the worker.
 
 A `running` row whose worker died
 with its process (a crash) is closed out as `interrupted` by
-`Database::reap_orphaned_automation_runs` — on the next TUI startup, and on
+`Database::reap_orphaned_automation_runs` — on every TUI automation pass and
 every headless `automation tick`, so a keeper-only install closes them out too.
 The cutoff is per run — its own automation's timeout plus a grace period — so
 neither a concurrent instance's healthy run nor a legitimately hour-long command
 is ever yanked out from under it.
+
+**One run at a time per automation.** A claim covers one schedule slot, so an
+`exec` slower than its interval would start again over the copy still running.
+The fire inserts its `running` row only when the automation has no live one —
+checked in the same statement (`Database::begin_exec_run`), so the TUI and a
+headless `tick` cannot both pass — and otherwise records a `skipped` run,
+*previous run still in flight*. Live means short of the reaper's cutoff above,
+so a crashed worker's row never blocks its automation.
+
+The command gets no stdin (`/dev/null`). The inherited one is the TUI's
+terminal, where a read from the job's own process group would stop it with
+`SIGTTIN` until the deadline killed it.
 
 ### Execution model
 

@@ -892,16 +892,32 @@ impl From<(AutomationRunStatus, String, Option<SessionId>)> for FireOutcome {
 /// Unlike the TUI this waits for the command inline — a `tick` process that
 /// detached the work would exit and strand the row as `running` — but it records
 /// the same `Running` → final pair, so a concurrently-open TUI sees the run
-/// appear while the command is still going.
+/// appear while the command is still going. While the automation's previous
+/// run (from the TUI or another tick) is still going, the fire is skipped
+/// instead (`Database::begin_exec_run`).
 fn fire_exec(
     db: &Database,
     automation_id: i64,
     command: &str,
     timeout_secs: Option<u64>,
 ) -> FireOutcome {
-    let run_id = db
-        .record_automation_run(automation_id, AutomationRunStatus::Running, command, None)
-        .ok();
+    let run_id = match db.begin_exec_run(automation_id, command) {
+        Ok(Some(id)) => Some(id),
+        Ok(None) => {
+            return (
+                AutomationRunStatus::Skipped,
+                crate::session::automation::EXEC_OVERLAP_SKIP_DETAIL.to_string(),
+                None,
+            )
+                .into()
+        }
+        // Run anyway and let `tick` record the outcome: losing the history row
+        // beats losing the scheduled job.
+        Err(e) => {
+            tracing::warn!("Failed to record run for automation {automation_id}: {e}");
+            None
+        }
+    };
     let (status, detail) = crate::session_ops::run_exec_command_with_timeout(command, timeout_secs);
     // Close out the `Running` row this fire already owns, so the fire keeps
     // exactly one history entry. If opening it failed, report `recorded: false`
@@ -2132,6 +2148,47 @@ mod tests {
         assert_eq!(runs.len(), 1, "got {runs:?}");
         assert_eq!(runs[0].status, AutomationRunStatus::Success);
         assert!(runs[0].finished_at.is_some());
+    }
+
+    /// A fire landing while the previous run (here a TUI worker's) is still
+    /// going records a skip and leaves that run alone.
+    #[test]
+    fn an_exec_fire_skips_while_its_previous_run_is_live() {
+        let db = Database::open_in_memory().unwrap();
+        create_automation(
+            &db,
+            CreateArgs {
+                name: "sync".into(),
+                trigger: "at:1".into(),
+                time: None,
+                weekday: None,
+                timezone: None,
+                prompts: Vec::new(),
+                step_delay: None,
+                action: ActionArgs {
+                    command: Some("true".into()),
+                    ..ActionArgs::default()
+                },
+                disabled: true,
+            },
+        )
+        .unwrap();
+        let id = db.list_automations().unwrap()[0].id;
+        let live = db.begin_exec_run(id, "true").unwrap().unwrap();
+        db.trigger_automation_now(id).unwrap();
+
+        let result = tick(&db).unwrap();
+
+        assert_eq!(result["fired"][0]["status"], "skipped");
+        let runs = db.list_automation_runs(id, 10).unwrap();
+        assert_eq!(runs.len(), 2, "got {runs:?}");
+        assert_eq!(runs[0].status, AutomationRunStatus::Skipped);
+        assert_eq!(
+            runs[0].detail,
+            crate::session::automation::EXEC_OVERLAP_SKIP_DETAIL
+        );
+        assert_eq!(runs[1].id, live);
+        assert_eq!(runs[1].status, AutomationRunStatus::Running);
     }
 
     #[test]

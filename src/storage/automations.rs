@@ -4,7 +4,7 @@
 //! `(action_kind, …)` with the action-specific columns. The `next_run_at`
 //! column is the dispatcher's scan key — see `app::process_automations`.
 
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{named_params, params, OptionalExtension};
 
 use crate::session::{
     Automation, AutomationAction, AutomationRun, AutomationRunStatus, AutomationSchedule,
@@ -20,6 +20,16 @@ use super::Database;
 /// a run that is merely *at* its deadline is never reaped from under a live
 /// worker.
 const REAP_GRACE_MS: u64 = 60_000;
+
+/// "This `automation_runs` row has outlived its automation's
+/// `action_timeout_secs` (the default when unset) plus [`REAP_GRACE_MS`]" —
+/// the reaper's cutoff. The Exec overlap guard treats every `running` row on
+/// the near side of it as live, so one predicate decides both: a row can never
+/// block its automation yet be out of the reaper's reach. Binds `:now`,
+/// `:default_ms` and `:grace`.
+const RUN_OUTLIVED_SQL: &str = "automation_runs.started_at < :now - :grace - COALESCE( \
+     (SELECT a.action_timeout_secs * 1000 FROM automations a \
+       WHERE a.id = automation_runs.automation_id), :default_ms)";
 
 /// Serialize the prompt-step list for the `prompt_steps` column.
 ///
@@ -358,16 +368,58 @@ impl Database {
         let default_ms =
             crate::session::automation::DEFAULT_EXEC_TIMEOUT_SECS.saturating_mul(1_000);
         self.conn.execute(
-            "UPDATE automation_runs \
-             SET status = 'error', \
-                 detail = 'interrupted (friring exited while the command was running)', \
-                 finished_at = ?1 \
-             WHERE status = 'running' \
-               AND started_at < ?1 - ?3 - COALESCE( \
-                     (SELECT a.action_timeout_secs * 1000 FROM automations a \
-                       WHERE a.id = automation_runs.automation_id), ?2)",
-            params![now as i64, default_ms as i64, REAP_GRACE_MS as i64],
+            &format!(
+                "UPDATE automation_runs \
+                 SET status = 'error', \
+                     detail = 'interrupted (friring exited while the command was running)', \
+                     finished_at = :now \
+                 WHERE status = 'running' AND {RUN_OUTLIVED_SQL}"
+            ),
+            named_params! {
+                ":now": now as i64,
+                ":default_ms": default_ms as i64,
+                ":grace": REAP_GRACE_MS as i64,
+            },
         )
+    }
+
+    /// Record an Exec fire's [`Running`](AutomationRunStatus::Running) row —
+    /// unless the automation already has a live one, in which case nothing is
+    /// written and `None` comes back.
+    ///
+    /// A claim covers one schedule slot, so a command slower than its interval
+    /// would otherwise start again over the copy still running: two syncs or
+    /// backups racing each other. The check shares the insert's statement, so
+    /// the TUI and a headless `tick` cannot both pass it. A `running` row past
+    /// the reaper's cutoff counts as dead: a crashed worker must not block its
+    /// automation for good.
+    pub fn begin_exec_run(
+        &self,
+        automation_id: i64,
+        detail: &str,
+    ) -> rusqlite::Result<Option<i64>> {
+        let now = current_time_millis();
+        let default_ms =
+            crate::session::automation::DEFAULT_EXEC_TIMEOUT_SECS.saturating_mul(1_000);
+        let inserted = self.conn.execute(
+            &format!(
+                "INSERT INTO automation_runs \
+                 (automation_id, started_at, status, detail, related_session_id, finished_at) \
+                 SELECT :id, :now, 'running', :detail, NULL, NULL \
+                 WHERE NOT EXISTS ( \
+                     SELECT 1 FROM automation_runs \
+                     WHERE automation_id = :id AND status = 'running' \
+                       AND NOT ({RUN_OUTLIVED_SQL}))"
+            ),
+            named_params! {
+                ":id": automation_id,
+                ":now": now as i64,
+                ":detail": detail,
+                ":default_ms": default_ms as i64,
+                ":grace": REAP_GRACE_MS as i64,
+            },
+        )?;
+        Ok((inserted > 0).then(|| self.conn.last_insert_rowid()))
     }
 
     /// List the most recent runs for an automation, newest first.
@@ -960,5 +1012,41 @@ mod tests {
         // Past its own deadline plus the grace: reaped.
         age_it(long_secs * 1_000 + REAP_GRACE_MS + 60_000);
         assert_eq!(db.reap_orphaned_automation_runs().unwrap(), 1);
+    }
+
+    #[test]
+    fn an_exec_run_cannot_start_over_a_live_one() {
+        let db = Database::open_in_memory().unwrap();
+        let exec = |name: &str| NewAutomation {
+            action: AutomationAction::Exec {
+                command: "sync.sh".into(),
+                timeout_secs: Some(60),
+            },
+            ..send_automation(name, Some(1))
+        };
+        let id = db.create_automation(&exec("sync")).unwrap();
+        let other = db.create_automation(&exec("backup")).unwrap();
+
+        let first = db.begin_exec_run(id, "sync.sh").unwrap().expect("idle");
+        assert_eq!(db.begin_exec_run(id, "sync.sh").unwrap(), None);
+        assert!(
+            db.begin_exec_run(other, "sync.sh").unwrap().is_some(),
+            "the guard is per automation"
+        );
+
+        db.finish_automation_run(first, AutomationRunStatus::Success, "ok")
+            .unwrap();
+        let second = db.begin_exec_run(id, "sync.sh").unwrap().expect("finished");
+
+        // A row past the reaper's cutoff belongs to a dead worker; it must not
+        // block the automation until something reaps it.
+        let started = current_time_millis().saturating_sub(60_000 + REAP_GRACE_MS + 60_000);
+        db.conn
+            .execute(
+                "UPDATE automation_runs SET started_at = ?1 WHERE id = ?2",
+                params![started as i64, second],
+            )
+            .unwrap();
+        assert!(db.begin_exec_run(id, "sync.sh").unwrap().is_some());
     }
 }
