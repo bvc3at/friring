@@ -5291,8 +5291,18 @@ impl App {
 
         // The def is looked up here (cheap registry read); its remote
         // adaptation — ssh round-trips — is deferred to
-        // `finalize_launch_provider` on the consumer's thread (ADR-P12).
-        let agent_def = self.agent_def_for(&config.agent);
+        // `finalize_launch_provider` on the consumer's thread (ADR-P12). A
+        // local launch still gets the per-session `--settings` repoint that
+        // `launch_provider_for` applies on restart: `finalize_launch_provider`
+        // leaves a local def untouched, and without it the activity view could
+        // not attribute this session's backgrounded workflows.
+        let mut agent_def = self.agent_def_for(&config.agent);
+        if spawn_host.is_none() {
+            agent_def.args = crate::session_ops::builtin_hooks::rewrite_settings_for_session(
+                &agent_session_id,
+                agent_def.args,
+            );
+        }
         let hooks_enabled = !self.db.builtin_hooks_opted_out().unwrap_or(false);
 
         Some(SpawnInputs {
@@ -11401,6 +11411,37 @@ mod tests {
     #[test]
     fn mouse_scroll_lines_constant() {
         assert_eq!(MOUSE_SCROLL_LINES, 3);
+    }
+
+    // --- Spawn input tests ---
+
+    /// A TUI spawn builds its def in `build_spawn_inputs`, not through
+    /// `launch_provider_for`, so the per-session `--settings` repoint has to
+    /// happen there as well: the activity view attributes a backgrounded
+    /// workflow to its session by that path.
+    #[cfg(unix)]
+    #[test]
+    fn local_spawn_inputs_point_hooks_settings_at_the_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(tmp.path());
+        let shared = crate::session_ops::builtin_hooks::hooks_settings_path().expect("shared path");
+        let home = Path::new(&shared).parent().unwrap();
+        std::fs::create_dir_all(home).unwrap();
+        std::fs::write(&shared, "{}").unwrap();
+        let agents: AgentRegistry = toml::from_str(&format!(
+            "default = \"claude\"\n[[agents]]\nname = \"claude\"\ncommand = \"claude\"\n\
+             args = [\"--settings\", \"{shared}\"]\n"
+        ))
+        .unwrap();
+        let mut app = App::new(24, 80, stub_backend(), agents, test_db());
+
+        let inputs = app
+            .build_spawn_inputs("s", &SessionConfig::default(), &[], &[], None)
+            .expect("local spawn inputs");
+
+        let sid = inputs.config.agent_session_id.as_deref().unwrap();
+        let per = format!("{}/sessions/{sid}.json", home.display());
+        assert_eq!(inputs.agent_def.args, vec!["--settings".to_string(), per]);
     }
 
     // --- Session naming tests ---
