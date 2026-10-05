@@ -414,12 +414,16 @@ pub(crate) fn resume_id_if_transcript_exists(
 /// Decide the `resume_session_id` to use when restarting a session, given the
 /// agent's definition.
 ///
+/// - A declared `[agents.<name>.transcript]` contract decides first, in both
+///   directions ([`conversation_exists`]).
 /// - Agents that resume "the latest session in the launch directory"
 ///   ([`AgentDef::resumes_latest`]) get the session id back as a non-`None`
 ///   *trigger*: their `resume_args` are id-less (no `{id}` token), so the value
 ///   itself is ignored — its presence is what makes [`AgentDef::build_args`]
 ///   emit the resume group. Restart always reuses the session's directory, so
 ///   the agent's own "last in cwd" resolution targets the right conversation.
+/// - A path-pinned agent (omp) resumes only when the session file it was
+///   launched with exists locally.
 /// - Everyone else (claude) falls back to the transcript check, which returns
 ///   the pinned id only when a resumable transcript exists on disk.
 ///
