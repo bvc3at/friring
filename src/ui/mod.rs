@@ -527,7 +527,8 @@ pub fn truncate_ellipsis(s: &str, max: usize) -> String {
 /// shrinks toward the right edge instead of running left under the tabs.
 ///
 /// Returns the title unchanged when nothing is reserved (no tabs) or it already
-/// fits, and an empty string when the tabs leave no usable room.
+/// fits in display columns, and an empty string when the tabs leave no usable
+/// room.
 pub fn fit_right_title(title: &str, border_width: u16, reserved_left: u16) -> String {
     if reserved_left == 0 {
         return title.to_string();
@@ -538,9 +539,6 @@ pub fn fit_right_title(title: &str, border_width: u16, reserved_left: u16) -> St
         .saturating_sub(2)
         .saturating_sub(reserved_left)
         .saturating_sub(1) as usize;
-    if title.chars().count() <= available {
-        return title.to_string();
-    }
     truncate_ellipsis(title, available)
 }
 
@@ -1478,6 +1476,15 @@ mod tests {
         // (ellipsis included) and can't extend left under the tab block.
         let fit = fit_right_title(" my-session (claude) [main] ", 20, 12);
         assert_eq!(fit.chars().count(), 5);
+        assert!(fit.ends_with('…'), "cut title carries an ellipsis: {fit:?}");
+    }
+
+    #[test]
+    fn fit_right_title_measures_display_columns() {
+        // 20 - 2 - 8 - 1 = 9 usable. Six wide glyphs are six chars but twelve
+        // columns, so a char count would pass them through and overrun the tabs.
+        let fit = fit_right_title("日本語の分岐", 20, 8);
+        assert!(fit.width() <= 9, "fits the budget in columns: {fit:?}");
         assert!(fit.ends_with('…'), "cut title carries an ellipsis: {fit:?}");
     }
 
