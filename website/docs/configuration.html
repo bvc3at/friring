@@ -540,8 +540,8 @@ min_interval_secs   = 5        # per-session floor between notifications</code><
             performs the same update on demand (<code>--force</code> bypasses the up-to-date and
             dev-build guards); dev builds (<code>0.0.0-dev</code>) never auto-update.
             <code>version_check</code> and <code>auto_update</code> are independent &mdash; set
-            either to <code>false</code> to make no network call or to keep friring from replacing
-            its own binary.
+            <code>auto_update = false</code> to keep friring from replacing its own binary, and
+            both to <code>false</code> to make no update-related network call.
           </p>
 
           <h3 id="notifications"><code>[notifications]</code> &mdash; OS notification settings</h3>

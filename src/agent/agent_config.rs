@@ -733,7 +733,7 @@ mod tests {
 
     /// The seed must carry copy-pasteable examples (add-your-own-agent +
     /// pin-a-model) but keep them commented, so parsing still yields exactly
-    /// the eight built-ins — a fresh install boots on pure defaults.
+    /// the nine built-ins — a fresh install boots on pure defaults.
     #[test]
     fn seed_documents_examples_yet_stays_builtin_only() {
         for marker in [
