@@ -2498,9 +2498,10 @@ real Claude turn and the stub's usage route.
   (`^H/^L` → `^H/` → `^H`).
 
 - **Widths are measured in display columns, not `char`s.** Upstream's
-  `ui::truncate_ellipsis`, `button_width` and the footer's own width helpers all
-  count `chars()`, so a double-width glyph — CJK or an emoji in a session or
-  task title, a rebound shortcut — is budgeted one column and painted in two: a
+  `ui::truncate_ellipsis`, `button_width`, the footer's own width helpers and
+  `ui::fit_right_title`'s already-fits check all count `chars()`, so a
+  double-width glyph — CJK or an emoji in a session or task title, a rebound
+  shortcut — is budgeted one column and painted in two: a
   row that "fits" overruns its rect and shoves the chrome right. They measure
   `unicode-width` now (already a direct dependency, used by `ui::links`), and a
   glyph that would straddle a truncation is dropped whole rather than
