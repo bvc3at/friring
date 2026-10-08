@@ -1783,7 +1783,8 @@ The fire inserts its `running` row only when the automation has no live one —
 checked in the same statement (`Database::begin_exec_run`), so the TUI and a
 headless `tick` cannot both pass — and otherwise records a `skipped` run,
 *previous run still in flight*. Live means short of the reaper's cutoff above,
-so a crashed worker's row never blocks its automation.
+so a crashed worker's row never blocks its automation. A fire whose check
+fails outright (a database error) runs nothing either.
 
 The command gets no stdin (`/dev/null`). The inherited one is the TUI's
 terminal, where a read from the job's own process group would stop it with
