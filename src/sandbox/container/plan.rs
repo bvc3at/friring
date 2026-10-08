@@ -255,7 +255,7 @@ pub fn plan_instance(input: PlanInput<'_>) -> SandboxResult<InstancePlan> {
             .cloned()
             .collect::<Vec<String>>(),
     )
-    .map_err(&refuse)?;
+    .map_err(refuse)?;
 
     let env = place_env(policy);
     let network = network_setting(policy);

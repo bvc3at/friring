@@ -887,7 +887,7 @@ impl<'a> SandboxLaunch<'a> {
             detail,
         };
         crate::sandbox::dirs::check_writable_roots(&self.writable_paths(), self.friring_db)
-            .map_err(&refuse)?;
+            .map_err(refuse)?;
         let (own_rw, own_ro) = self.child_own_paths();
         let declared: Vec<String> = self
             .policy
@@ -897,9 +897,9 @@ impl<'a> SandboxLaunch<'a> {
             .filter(|path| !own_rw.contains(*path) && !own_ro.contains(*path))
             .cloned()
             .collect();
-        crate::sandbox::dirs::check_declared_paths(&declared).map_err(&refuse)?;
+        crate::sandbox::dirs::check_declared_paths(&declared).map_err(refuse)?;
         crate::sandbox::dirs::check_engine_socket_paths(&declared, Some(self.home))
-            .map_err(&refuse)?;
+            .map_err(refuse)?;
         if crate::sandbox::egress::proxy_required(self.policy) && self.proxy.is_none() {
             let denied: Vec<String> = self.policy.deny.iter().map(|r| r.to_string()).collect();
             let what = if self.policy.network == NetworkMode::Full {
