@@ -2598,6 +2598,18 @@ real Claude turn and the stub's usage route.
   manages — every one of them spawns a process or a tmux window in between — so
   this is the ordering contract made airtight rather than an observed bug.
 
+- **A clicked link opens without a shell, and only on a web or file scheme.**
+  Upstream's OSC 8 support
+  ([`42027005`](https://github.com/Thurbeen/thurbox/commit/42027005)) opens a
+  `Ctrl+Click`ed link on Windows through `cmd /C start`, which parses the URL
+  as a command line: an `&` in an agent-supplied query string ends the `start`
+  and runs the rest as a command of its own. Windows uses
+  `rundll32 url.dll,FileProtocolHandler` here, which takes the URL as data. An
+  OSC 8 target is also hidden behind its label, so a click opens only the
+  schemes the plain-text scan linkifies (`https://`, `http://`, `file://`,
+  `ui::links::is_linkable_url`); any other target is copied to the clipboard
+  instead.
+
 ### Performance
 
 - **Shell-tab keystrokes echo immediately.** The demand-driven render loop's

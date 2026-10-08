@@ -3963,7 +3963,8 @@ impl App {
         match helpers::open_url(&url) {
             Ok(()) => self.set_status(StatusLevel::Info, format!("Opening {url}")),
             // No browser reachable — the normal state for a friring running on a
-            // headless or SSH host. The clipboard still reaches the user: its
+            // headless or SSH host — or a scheme a click may not open. Copying
+            // stays safe either way, and the clipboard still reaches the user: its
             // tmux / OSC 52 fallbacks travel to the terminal they are sitting at,
             // so the URL lands in *their* clipboard, ready to paste into a real
             // browser.

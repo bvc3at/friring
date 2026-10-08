@@ -104,20 +104,44 @@ pub(super) fn paint_hyperlinks(paints: &[HyperlinkPaint]) -> std::io::Result<()>
 
 /// Hand `url` to the platform's URL opener.
 ///
-/// `Err` carries a short, user-facing reason the machine can't open a browser —
-/// the common case being a friring running on a headless or SSH host, where the
-/// caller falls back to putting the URL on the clipboard instead. The child is
-/// **not** waited on (a browser launcher can take seconds, and the render loop
-/// must not park), so a spawn that succeeds is reported as opened.
+/// `Err` carries a short, user-facing reason the URL wasn't opened: a scheme a
+/// click may not open ([`crate::ui::links::is_linkable_url`]), or a machine
+/// that can't open a browser — the common case being a friring running on a
+/// headless or SSH host. The caller falls back to putting the URL on the
+/// clipboard instead. The child is **not** waited on (a browser launcher can
+/// take seconds, and the render loop must not park), so a spawn that succeeds
+/// is reported as opened.
 pub(super) fn open_url(url: &str) -> Result<(), String> {
+    let (program, args) = url_opener(url)?;
+    std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => format!("No URL opener ({program} not installed)"),
+            _ => format!("Could not run {program}: {e}"),
+        })
+}
+
+/// The command [`open_url`] would spawn for `url`, or its reason not to.
+/// Separate so a test can check what reaches the opener without starting one.
+fn url_opener(url: &str) -> Result<(&'static str, Vec<&str>), String> {
+    if !crate::ui::links::is_linkable_url(url) {
+        return Err("Not a web or file link".into());
+    }
     #[cfg(target_os = "macos")]
-    let (program, args): (&str, Vec<&str>) = ("open", vec![url]);
+    let opener = ("open", vec![url]);
+    // Not `cmd /C start`: cmd parses its arguments as a command line, so an `&`
+    // in an agent-supplied query string would end the `start` and run the rest
+    // as a command of its own. `FileProtocolHandler` takes the URL as data and
+    // hands it to the shell's own URL association.
     #[cfg(target_os = "windows")]
-    // `start` is a cmd builtin; its first quoted argument is the window title,
-    // so an empty one keeps the URL from being eaten as one.
-    let (program, args): (&str, Vec<&str>) = ("cmd", vec!["/C", "start", "", url]);
+    let opener = ("rundll32", vec!["url.dll,FileProtocolHandler", url]);
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let (program, args): (&str, Vec<&str>) = {
+    let opener = {
         // Spawning `xdg-open` with nothing to open into either fails or, worse,
         // succeeds and does nothing — so decide up front rather than report a
         // browser that never appeared.
@@ -130,18 +154,7 @@ pub(super) fn open_url(url: &str) -> Result<(), String> {
         }
         ("xdg-open", vec![url])
     };
-
-    std::process::Command::new(program)
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => format!("No URL opener ({program} not installed)"),
-            _ => format!("Could not run {program}: {e}"),
-        })
+    Ok(opener)
 }
 
 /// Whether anything on this machine could show a URL: a display server, or a
@@ -403,6 +416,33 @@ mod tests {
         assert!(has_browser_target(None, Some("wayland-0"), None));
         // `BROWSER` is the user telling us how to open a URL without a display.
         assert!(has_browser_target(None, None, Some("firefox")));
+    }
+
+    #[test]
+    fn a_scheme_a_click_may_not_open_never_reaches_the_opener() {
+        // An OSC 8 target is agent text hidden behind its label, so it must not
+        // reach an app's own handler. Checked on `url_opener`, which spawns
+        // nothing, so a broken guard fails here without launching anything.
+        for url in [
+            "vscode://file/etc/passwd",
+            "javascript:alert(1)",
+            "ms-settings:",
+        ] {
+            assert_eq!(
+                url_opener(url),
+                Err("Not a web or file link".to_string()),
+                "{url}"
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn the_opener_gets_the_url_as_one_argument() {
+        // `&` is what `cmd /C start` used to split on.
+        let url = "https://example.com/?a=1&b=2";
+        let (_, args) = url_opener(url).unwrap();
+        assert_eq!(args.last(), Some(&url));
     }
 
     #[test]
