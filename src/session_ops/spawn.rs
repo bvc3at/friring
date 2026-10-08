@@ -643,7 +643,14 @@ pub(crate) fn adapt_agent_args_for_remote_with_report(
     args: Vec<String>,
 ) -> (Vec<String>, Vec<String>) {
     let target = super::builtin_hooks::remote_signal_target(host);
+    // A closed psmux gate keeps the literals as they are, like the config paths
+    // it strips: nothing polls the pane option there yet, so a rewrite would
+    // only hide that the session reports no status (`adapt_def_for_launch`
+    // surfaces it instead).
     let rewrite_literals = |args: Vec<String>| -> Vec<String> {
+        if psmux_signals_gated(host) {
+            return args;
+        }
         args.into_iter()
             .map(|a| super::builtin_hooks::rewrite_hook_signals_for_target(&a, &target))
             .collect()
@@ -738,17 +745,43 @@ pub(crate) fn adapt_def_for_launch(
     let (args, stripped) = adapt_agent_args_for_remote_with_report(h, def.args);
     def.args = args;
     // A stripped config path outranks a provisioning note: it means the
-    // agent's own hooks file never reached the host at all.
-    let degraded = if stripped.is_empty() {
-        super::remote_hooks::provision_agent_hooks_on_host(h, &def.name, hooks_enabled)
-    } else {
+    // agent's own hooks file never reached the host at all. Hook commands left
+    // unwired in the args mean the same for an agent that carries them there
+    // (aider), which has no config-dir payload to report on.
+    let degraded = if !stripped.is_empty() {
         Some(format!(
             "hooks config stripped for host '{}' (no status): {}",
             h.name,
             stripped.join(", ")
         ))
+    } else if let Some(note) = unwired_signal_note(h, &def.name, &def.args) {
+        Some(note)
+    } else {
+        super::remote_hooks::provision_agent_hooks_on_host(h, &def.name, hooks_enabled)
     };
     (def, degraded)
+}
+
+/// Whether `host` is a psmux host while [`psmux_hook_rewrite_supported`] is
+/// off — where no friring-managed hook command can report yet.
+fn psmux_signals_gated(host: &HostDef) -> bool {
+    host.mux() == "psmux" && !psmux_hook_rewrite_supported()
+}
+
+/// The hook-wiring note for launch `args` that still carry a friring-managed
+/// hook command on a gated psmux host ([`psmux_signals_gated`]), which leaves
+/// them as they are.
+fn unwired_signal_note(host: &HostDef, agent: &str, args: &[String]) -> Option<String> {
+    let unwired = psmux_signals_gated(host)
+        && args
+            .iter()
+            .any(|a| a.contains(crate::session::STATUS_SIGNAL_MARKER));
+    unwired.then(|| {
+        format!(
+            "{agent} hook commands not wired on psmux host '{}' (no status)",
+            host.name
+        )
+    })
 }
 
 /// The home dir to expand `{home}` against for a launch on `host`: the remote
@@ -1195,8 +1228,9 @@ mod tests {
             .map(String::from)
         );
 
-        // A psmux host gets the socket-explicit psmux form (psmux has no
-        // in-pane `$TMUX` socket resolution).
+        // A psmux host keeps them as they are while its gate is closed —
+        // nothing polls the pane option there — and the launch reports the
+        // hooks as unwired instead.
         let psmux_host = HostDef {
             name: "winbox".into(),
             destination: "user@winbox".into(),
@@ -1204,8 +1238,18 @@ mod tests {
             socket: Some("tb".into()),
             ..Default::default()
         };
-        let out = adapt_agent_args_for_remote(&psmux_host, args);
-        assert_eq!(out[2], "psmux -L tb set-option -p @friring_state blocked");
+        assert!(!psmux_hook_rewrite_supported());
+        let out = adapt_agent_args_for_remote(&psmux_host, args.clone());
+        assert_eq!(out, args);
+        assert_eq!(
+            unwired_signal_note(&psmux_host, "aider", &out).as_deref(),
+            Some("aider hook commands not wired on psmux host 'winbox' (no status)")
+        );
+        assert_eq!(unwired_signal_note(&host, "aider", &args), None);
+        assert_eq!(
+            unwired_signal_note(&psmux_host, "aider", &["--model".to_string()]),
+            None
+        );
     }
 
     #[test]

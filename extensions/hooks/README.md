@@ -217,7 +217,8 @@ control-mode connection. Delivery per agent, at spawn time:
 
 - **claude** — the `--settings` hooks file is copied to the host (rewritten)
   and the arg substituted.
-- **aider** — its literal `--notifications-command` arg is rewritten in place.
+- **aider** — its literal `--notifications-command` arg is rewritten in place
+  (left as it is on a still-gated psmux host, which shows `Hooks: degraded`).
 - **codex / antigravity / opencode / vibe / copilot** — the rewritten payload
   is provisioned into the host's agent config dir
   (`session_ops::remote_hooks`), with the same safety rules as the local
