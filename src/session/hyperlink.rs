@@ -14,6 +14,11 @@
 //! redraws. Resolution re-checks that the label is still on screen at that
 //! column, so a row whose content has since been overwritten resolves to
 //! nothing rather than to a stale URL.
+//!
+//! The cost of that key: one label at one column is one entry. Two links
+//! printing the same label there both resolve to the newer target, and plain
+//! text printing a captured label at its column resolves too. Telling the
+//! occurrences apart would mean tracking each one across scrolls and redraws.
 
 use std::collections::{HashSet, VecDeque};
 

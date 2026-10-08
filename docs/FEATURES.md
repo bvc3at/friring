@@ -4165,7 +4165,10 @@ a cell (`App::url_at_click`):
   moves every time the transcript scrolls, the printed glyphs and their
   column survive it. A click resolves only if that label is still on
   screen at that column, so a row whose content has moved on resolves
-  to nothing rather than to a stale URL. A run the screen scrolled
+  to nothing rather than to a stale URL. The cost: one label at one
+  column is one entry, so two links printing the same label there both
+  open the newer target, and plain text matching a captured label at its
+  column opens it too. A run the screen scrolled
   under mid-print is dropped for the same reason (agents redraw and
   re-emit the escape); a run long enough to wrap contributes one entry
   per row. The table is bounded at 512 runs per session.
