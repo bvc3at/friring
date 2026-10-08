@@ -2830,6 +2830,12 @@ test / lint jobs run normally on the fork.
   All of it needs only the built-in `GITHUB_TOKEN`. Upstream's AUR / Chocolatey
   / winget publish jobs were deleted along with their manifests — those channels
   carry upstream's package identity and the fork has no accounts for them.
+- **The release gate does not count `tests/` as shipped.** Upstream's
+  shipped-artifact gate
+  ([`4857b8ba`](https://github.com/Thurbeen/thurbox/commit/4857b8ba)) lists
+  `tests/` among the paths a user installs, so a test-only `fix` would cut a
+  release. Here that matters more: `auto_update` is on by default, so every
+  install would download and swap in a byte-identical binary.
 - `.github/workflows/ci.yml` — the `sonarqube` job is dormant; SonarQube is not
   set up for the fork at the moment. The `changes` (paths-filter) job also grants
   `pull-requests: read`, which a **private** repo's default token lacks (public

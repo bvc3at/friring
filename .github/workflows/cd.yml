@@ -119,13 +119,15 @@ jobs:
           # Homebrew formula for a binary that did not change.
           #
           # So gate on the diff as well: release only when something a user
-          # actually installs changed. The range is the whole span since the last
+          # actually installs changed. `tests/` is not on the list: a test-only
+          # `fix` changes no installed byte either, and with `auto_update` on
+          # by default every install would download and swap in the same binary. The range is the whole span since the last
           # tag, NOT this single push — a website-only push landing on top of an
           # unreleased `src/` commit still owes that release.
           #
           # A forced `workflow_dispatch` version skips this gate entirely (the
           # `if:` above): an explicit human cut is always honoured.
-          SHIPPED_PATHS='^(src/|tests/|build\.rs$|Cargo\.toml$|Cargo\.lock$|rust-toolchain\.toml$|Cross\.toml$|extensions/|packaging/|scripts/install\.(sh|ps1)$|\.github/workflows/cd\.yml$)'
+          SHIPPED_PATHS='^(src/|build\.rs$|Cargo\.toml$|Cargo\.lock$|rust-toolchain\.toml$|Cross\.toml$|extensions/|packaging/|scripts/install\.(sh|ps1)$|\.github/workflows/cd\.yml$)'
 
           LAST_TAG="$(git describe --tags --abbrev=0 2>/dev/null || true)"
 
