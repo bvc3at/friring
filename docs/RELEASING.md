@@ -21,9 +21,10 @@ Every push to `main` automatically triggers the release workflow:
    - **Commit type** (`check-release`'s `parse` step): commits must include
      `feat`, `fix`, or `perf`. Only docs/chore/ci commits → no release.
    - **Artifact relevance** (`check-release`'s `shipped` step): the diff since
-     the last tag must touch something a user installs (`src/`, `tests/`,
-     `build.rs`, `Cargo.toml`/`Cargo.lock`, `rust-toolchain.toml`, `Cross.toml`,
-     `extensions/`, `packaging/`, `scripts/install.{sh,ps1}`, `cd.yml`).
+     the last tag must touch something a user installs (`src/`, `build.rs`,
+     `Cargo.toml`/`Cargo.lock`, `rust-toolchain.toml`, `Cross.toml`,
+     `extensions/`, `packaging/`, `scripts/install.{sh,ps1}`, `cd.yml`). `tests/`
+     is left out: a test-only `fix` changes no installed byte.
      Commit type alone over-releases: Renovate labels a GitHub-Actions pin bump
      `fix(deps)` and the website is versioned `feat(ui)`/`fix(ui)`, so a
      CSS-only or lint-action-only change would cut a real release — burning a
