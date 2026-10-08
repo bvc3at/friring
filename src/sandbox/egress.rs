@@ -464,7 +464,7 @@ pub fn prepare_at(
     let bind = match transport {
         ProxyTransport::Loopback => StartBind::Loopback,
         ProxyTransport::UnixSocket => {
-            let (primary, alternate) = socket_paths(scratch).map_err(&refuse)?;
+            let (primary, alternate) = socket_paths(scratch).map_err(refuse)?;
             StartBind::UnixSocket {
                 primary,
                 alternate,
