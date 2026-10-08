@@ -4209,7 +4209,10 @@ Two properties keep this safe and cheap:
 The URL is stripped of control characters before it goes out
 (`hyperlink::osc8_open`): it is agent-controlled text being written back
 to the user's terminal, and an embedded `ESC` would end the sequence
-early and let the rest be interpreted as escapes of its own.
+early and let the rest be interpreted as escapes of its own. Only a
+target friring's own click would open (`ui::links::is_linkable_url`, see
+below) is handed over at all: the terminal's gesture opens what it is
+given, so a custom scheme behind a label never reaches it.
 
 **Caveat:** while friring has mouse capture on (`[features] mouse`), a
 terminal that forwards Ctrl+Click to the application instead of handling
