@@ -4052,6 +4052,12 @@ impl App {
             }
             let rows = crate::ui::links::extract_screen_rows(parser.screen());
             for run in parser.callbacks().hyperlinks().visible_runs(&rows) {
+                // The terminal's own gesture opens what it is handed, so a
+                // target friring's click would not open (`open_url`) is not
+                // handed over either.
+                if !crate::ui::links::is_linkable_url(run.url) {
+                    continue;
+                }
                 if run.row >= inner.height as usize || run.col >= inner.width as usize {
                     continue;
                 }

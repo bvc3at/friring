@@ -2609,7 +2609,7 @@ real Claude turn and the stub's usage route.
   OSC 8 target is also hidden behind its label, so a click opens only the
   schemes the plain-text scan linkifies (`https://`, `http://`, `file://`,
   `ui::links::is_linkable_url`); any other target is copied to the clipboard
-  instead.
+  instead, and is not handed back to the outer terminal as a link either.
 
 - **Hook args on a psmux host stay as they are while its gate is closed.**
   Upstream's remote status

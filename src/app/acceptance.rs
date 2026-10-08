@@ -4778,6 +4778,24 @@ fn a_rendered_rich_text_link_is_handed_to_the_outer_terminal() {
 }
 
 #[test]
+fn a_link_friring_would_not_open_is_not_handed_to_the_outer_terminal() {
+    // An app's custom scheme behind a harmless label: friring's own click
+    // refuses it, so the outer terminal must not be given it to open either.
+    let mut h = Harness::standard(1);
+    h.feed_output(
+        0,
+        b"see \x1b]8;;vscode://file/etc/passwd\x07Docs\x1b]8;;\x07 and \x1b]8;;https://github.com\x07Github\x1b]8;;\x07\r\n",
+    );
+    h.render();
+
+    let paints = h
+        .app
+        .terminal_hyperlink_paints(h.terminal.backend().buffer());
+    let urls: Vec<&str> = paints.iter().map(|p| p.url.as_str()).collect();
+    assert_eq!(urls, ["https://github.com"]);
+}
+
+#[test]
 fn split_utf8_output_chunks_render_intact() {
     // The reader loop protects vt100 from mid-codepoint chunks with a carry
     // buffer; `feed_output` bypasses the reader, so this documents that a test
