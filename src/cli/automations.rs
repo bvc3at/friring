@@ -894,7 +894,8 @@ impl From<(AutomationRunStatus, String, Option<SessionId>)> for FireOutcome {
 /// the same `Running` → final pair, so a concurrently-open TUI sees the run
 /// appear while the command is still going. While the automation's previous
 /// run (from the TUI or another tick) is still going, the fire is skipped
-/// instead (`Database::begin_exec_run`).
+/// instead (`Database::begin_exec_run`), and a fire that cannot run that check
+/// records an error without running.
 fn fire_exec(
     db: &Database,
     automation_id: i64,
@@ -902,7 +903,7 @@ fn fire_exec(
     timeout_secs: Option<u64>,
 ) -> FireOutcome {
     let run_id = match db.begin_exec_run(automation_id, command) {
-        Ok(Some(id)) => Some(id),
+        Ok(Some(id)) => id,
         Ok(None) => {
             return (
                 AutomationRunStatus::Skipped,
@@ -911,26 +912,29 @@ fn fire_exec(
             )
                 .into()
         }
-        // Run anyway and let `tick` record the outcome: losing the history row
-        // beats losing the scheduled job.
+        // Fail closed, as the TUI's fire does: when the check itself fails,
+        // nothing says the previous run has finished, so running would risk the
+        // overlap it exists to prevent. `tick` records the error.
         Err(e) => {
-            tracing::warn!("Failed to record run for automation {automation_id}: {e}");
-            None
+            tracing::warn!("Failed to check automation {automation_id} for a live run: {e}");
+            return (
+                AutomationRunStatus::Error,
+                format!("could not check for a live run: {e}"),
+                None,
+            )
+                .into();
         }
     };
     let (status, detail) = crate::session_ops::run_exec_command_with_timeout(command, timeout_secs);
     // Close out the `Running` row this fire already owns, so the fire keeps
-    // exactly one history entry. If opening it failed, report `recorded: false`
+    // exactly one history entry. If closing it fails, report `recorded: false`
     // and let `tick` write the final row instead of losing the run entirely.
-    let recorded = match run_id {
-        Some(id) => match db.finish_automation_run(id, status, &detail) {
-            Ok(updated) => updated,
-            Err(e) => {
-                tracing::warn!("Failed to finish automation run {id}: {e}");
-                false
-            }
-        },
-        None => false,
+    let recorded = match db.finish_automation_run(run_id, status, &detail) {
+        Ok(updated) => updated,
+        Err(e) => {
+            tracing::warn!("Failed to finish automation run {run_id}: {e}");
+            false
+        }
     };
     FireOutcome {
         status,
@@ -2189,6 +2193,28 @@ mod tests {
         );
         assert_eq!(runs[1].id, live);
         assert_eq!(runs[1].status, AutomationRunStatus::Running);
+    }
+
+    #[test]
+    fn an_exec_fire_that_cannot_check_for_a_live_run_does_not_run() {
+        let db = Database::open_in_memory().unwrap();
+        let scratch = tempfile::TempDir::new().unwrap();
+        let ran = scratch.path().join("ran");
+        // A check that genuinely fails, rather than a seam: there is no table.
+        db.conn_ref()
+            .execute("DROP TABLE automation_runs", [])
+            .unwrap();
+
+        let outcome = fire_exec(&db, 1, &format!("touch '{}'", ran.display()), None);
+
+        assert_eq!(outcome.status, AutomationRunStatus::Error);
+        assert!(
+            outcome.detail.starts_with("could not check for a live run"),
+            "{}",
+            outcome.detail
+        );
+        assert!(!outcome.recorded);
+        assert!(!ran.exists(), "the command ran without the check");
     }
 
     #[test]
