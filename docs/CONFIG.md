@@ -633,7 +633,9 @@ backend-name helpers `is_ssh_backend` / `is_wsl_backend` /
   the flag+path pair is **stripped** so the agent launches clean —
   surfaced as a `Hooks: degraded` row in the info panel
   (`SessionInfo.hook_wiring`). Literal signal commands carried
-  directly in args (aider's `--notifications-command`) are rewritten too.
+  directly in args (aider's `--notifications-command`) are rewritten too —
+  except on that gated psmux host, where they stay as they are and the
+  session shows the same `Hooks: degraded` row.
   The local-path env hints
   (`FRIRING_METRICS_DIR` / `FRIRING_CONFIG_DIR` / `FRIRING_DATA_DIR`) are
   likewise skipped for remote spawns (`inject_friring_env`); only the

@@ -2610,6 +2610,16 @@ real Claude turn and the stub's usage route.
   `ui::links::is_linkable_url`); any other target is copied to the clipboard
   instead.
 
+- **Hook args on a psmux host stay as they are while its gate is closed.**
+  Upstream's remote status
+  ([`585fcd63`](https://github.com/Thurbeen/thurbox/commit/585fcd63)) rewrites
+  a hook command carried in an agent's args (aider's `--notifications-command`)
+  for a psmux host even while `psmux_hook_rewrite_supported` is off, when
+  nothing polls the pane option it sets, so the session reported no status and
+  no `Hooks: degraded` row either. The args now stay as they are, as the gate's
+  "closed means the old behavior" contract says, and the launch reports the
+  hooks as unwired.
+
 ### Performance
 
 - **Shell-tab keystrokes echo immediately.** The demand-driven render loop's
