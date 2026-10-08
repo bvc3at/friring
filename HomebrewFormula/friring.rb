@@ -23,7 +23,7 @@
 class Friring < Formula
   desc "TUI for orchestrating multiple coding-agent CLI sessions in persistent tmux panels"
   homepage "https://github.com/bvc3at/friring"
-  version "0.13.0"
+  version "0.24.0"
   license "MIT"
 
   depends_on "git"
@@ -32,14 +32,14 @@ class Friring < Formula
   on_macos do
     on_arm do
       url "https://github.com/bvc3at/friring/releases/download/v#{version}/friring-v#{version}-aarch64-apple-darwin.tar.gz"
-      sha256 "7c79d5740b050b29f55319964a7c72e5dca3ef0c4e051fb09a842fcd15027ef0"
+      sha256 "a66d174d4bccdebaed9adcc7211a247d1fd4a1a308ea9df74cb19564315ba166"
     end
   end
 
   on_linux do
     on_intel do
       url "https://github.com/bvc3at/friring/releases/download/v#{version}/friring-v#{version}-x86_64-unknown-linux-musl.tar.gz"
-      sha256 "52d6fc2c4f90c915a57fdabbbc3ac355eef290f2fb64a9a0fb797d35296508a5"
+      sha256 "55acda055f0b2fb37f1dfa80e1abcb530c40a891190d24a8f0e6e6b845fd40a5"
     end
   end
 
