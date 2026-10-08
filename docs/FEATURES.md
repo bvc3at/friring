@@ -4220,13 +4220,21 @@ couldn't be acted on is never indistinguishable from a click on plain
 text (it used to be: the opener was spawned with its result discarded).
 
 `helpers::open_url` hands the URL to the platform opener — `open` on
-macOS, `cmd /C start` on Windows, `xdg-open` elsewhere. On Linux/BSD it
-first checks there is something to open *into* (`DISPLAY`,
-`WAYLAND_DISPLAY`, or a `BROWSER` the user set): a friring running on a
-headless or SSH host has none, where spawning `xdg-open` either fails or
-— worse — succeeds and does nothing.
+macOS, `rundll32 url.dll,FileProtocolHandler` on Windows, `xdg-open`
+elsewhere. Windows avoids `cmd /C start`: cmd would parse the URL as a
+command line, so an `&` in an agent's query string would run the rest as
+a command. On Linux/BSD it first checks there is something to open *into*
+(`DISPLAY`, `WAYLAND_DISPLAY`, or a `BROWSER` the user set): a friring
+running on a headless or SSH host has none, where spawning `xdg-open`
+either fails or — worse — succeeds and does nothing.
 
-With no browser reachable the URL goes to the **clipboard** instead
+Only the schemes the plain-text scan linkifies (`https://`, `http://`,
+`file://`) are opened (`ui::links::is_linkable_url`). An OSC 8 target is
+agent-controlled and hidden behind its label, so it must not reach a
+handler a visible URL never could — an app's custom scheme, say.
+
+With no browser reachable, or a scheme that isn't opened, the URL goes to
+the **clipboard** instead
 (`App::set_clipboard_text`, the same native → tmux → OSC 52 path `Ctrl+C`
 uses). That is what makes the feature work over SSH at all: the tmux and
 OSC 52 fallbacks travel to the terminal the user is sitting at, so the URL

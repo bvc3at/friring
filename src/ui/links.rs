@@ -10,6 +10,17 @@ pub struct DetectedLink {
 /// URL schemes we linkify, matching the old `(?:https?|file)://` prefix.
 const SCHEMES: [&str; 3] = ["https://", "http://", "file://"];
 
+/// Whether `url` starts with a scheme this module linkifies (compared
+/// case-insensitively, as schemes are). A click opens nothing else: an OSC 8
+/// target is agent-controlled and its label hides it, so it must not reach a
+/// handler a visible URL never could — an app's custom scheme, say.
+pub fn is_linkable_url(url: &str) -> bool {
+    SCHEMES.iter().any(|scheme| {
+        url.get(..scheme.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
+    })
+}
+
 /// A URL run stops at whitespace or any of these terminators (the old
 /// character class `[^\s<>"'\x60)\]]`).
 fn is_url_terminator(c: char) -> bool {
@@ -107,6 +118,17 @@ pub fn url_at_position(links: &[DetectedLink], row: usize, col: usize) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_linkified_schemes_are_openable() {
+        assert!(is_linkable_url("https://example.com/?a=1&b=2"));
+        assert!(is_linkable_url("HTTP://example.com"));
+        assert!(is_linkable_url("file:///tmp/notes.md"));
+        assert!(!is_linkable_url("vscode://file/tmp/notes.md"));
+        assert!(!is_linkable_url("javascript:alert(1)"));
+        assert!(!is_linkable_url("http:"));
+        assert!(!is_linkable_url("ééééééé"));
+    }
 
     #[test]
     fn detect_https_url() {
