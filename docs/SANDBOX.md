@@ -1603,9 +1603,9 @@ does read in `tmp_env`, and gets the same directory there: Claude Code ignores
 so the built-in claude declares `tmp_env = ["CLAUDE_CODE_TMPDIR"]`. A declared
 name that collides with one friring sets itself — the signal file, the proxy, a
 credential — is overruled by friring's value. An entry that is not a variable
-name (`HTTPS_PROXY=x`) is skipped, as a malformed `config_dir_env` is: tmux
-would read its `NAME=VALUE` as one more assignment to `HTTPS_PROXY`, past that
-precedence.
+name (`HTTPS_PROXY=x`) is skipped, as a malformed `config_dir_env` or static
+`env` key is: tmux would read its `NAME=VALUE` as one more assignment to
+`HTTPS_PROXY`, past that precedence.
 
 ## Launch integration
 
