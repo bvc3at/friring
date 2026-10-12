@@ -2401,7 +2401,9 @@ mod tests {
         profile.network_allow = vec!["api.anthropic.com".into()];
         let mut config = config_with(Some(profile));
         config.agent_session_id = Some("egress-launch".into());
-        let def = agent_def();
+        let mut def = agent_def();
+        // A declared tmp_env name that collides with a proxy variable is overruled.
+        def.sandbox.as_mut().unwrap().tmp_env = vec!["HTTPS_PROXY".into()];
 
         let wrapped = build(
             &mac_host(),
@@ -3591,7 +3593,14 @@ mod tests {
 
         let scratch = wrapped.env.get("TMPDIR").cloned().unwrap();
         assert_eq!(wrapped.env.get("CLAUDE_CODE_TMPDIR"), Some(&scratch));
-        let signal = wrapped.env.get(crate::paths::SIGNAL_FILE_ENV);
-        assert!(signal.is_some_and(|v| v != &scratch), "{signal:?}");
+        assert_eq!(
+            wrapped
+                .env
+                .get(crate::paths::SIGNAL_FILE_ENV)
+                .map(String::as_str),
+            crate::paths::session_signal_file("tmp-env-test")
+                .map(|p| p.display().to_string())
+                .as_deref()
+        );
     }
 }
