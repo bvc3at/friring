@@ -1496,7 +1496,8 @@ sandboxed codex while the same `touch` under the same generated profile was
 refused. The built-in codex therefore lists `--no-daemon` among its `bypass`
 flags, which keeps the whole agent inside the boundary. That is a declaration
 the agent honours, not something the boundary enforces: a process inside can
-still dial the socket itself.
+still dial the socket itself. An `agents.toml` seeded earlier lacks the flag, so
+add it to your codex entry's `bypass` by hand ([CONFIG.md](CONFIG.md#agentstoml)).
 
 The tradeoff is real and worth stating in the docs: with the inner sandbox off,
 anything inside the boundary — including the agent's own credentials — is

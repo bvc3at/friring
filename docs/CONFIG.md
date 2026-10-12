@@ -126,7 +126,12 @@ agent, add its `[[agents]]` block by hand (copy it from this file's
 built-in list) or delete `agents.toml` to re-seed the full set. The
 matching status hook is wired automatically once the agent's config dir
 exists — the built-in hooks extension self-heals on every startup/tick,
-independent of `agents.toml`.
+independent of `agents.toml`. A changed declaration of an existing
+built-in is not merged either: an `agents.toml` seeded before `tmp_env`
+and `--no-daemon` existed should get `tmp_env = ["CLAUDE_CODE_TMPDIR"]`
+added to claude's `[agents.sandbox]` and `"--no-daemon"` added to codex's
+`bypass`. Without them, claude dies at startup under a policy profile and
+codex runs its commands through a host-side server outside the boundary.
 
 ```toml
 config_version = 1
