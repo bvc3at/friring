@@ -1786,10 +1786,13 @@ is added read-only, with the file it resolves to. Without it claude dies on
 "Error processing settings: EPERM" under every profile that does not list the
 config directory, which no profile should have to. A path that resolves *out* of
 the config directory, or to anything but a regular file, is not granted. Nor is
-anything on the [credential deny list](#credentials): a config directory
-relocated over the home (`FRIRING_CONFIG_DIR=~`) would otherwise let an argument
-name `~/.ssh/…`, and bwrap's narrow scope has no secret mask to put back over an
-exact bind the way seatbelt's trailing denies do. A place gets these files
+anything bwrap's host scope masks: the [credential deny list](#credentials),
+friring's sandbox state, gate and signal trees, and the database. A config
+directory relocated over the home or the data directory
+(`FRIRING_CONFIG_DIR=~`) would otherwise let an argument, or a symlink beside
+the hook file, name `~/.ssh/…` or `friring.db`. bwrap's narrow scope has no
+mask to put back over an exact bind the way seatbelt's trailing denies do, so
+the check is made on the resolved target. A place gets these files
 projected instead (see [Config projection](#config-projection)).
 
 What the program then *opens* is still the profile's to grant. An extension that

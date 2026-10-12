@@ -471,23 +471,40 @@ pub(crate) const TEST_HELPER_PROGRAM: &str = "/usr/local/bin/friring-cli";
 /// did not make would otherwise turn "read friring's hook file" into "read
 /// whatever it points at".
 ///
-/// Nothing on the credential deny list (`crate::sandbox::secrets`) is granted
-/// either, whoever's it is. A config directory relocated to an ancestor of the
-/// home (`FRIRING_CONFIG_DIR=~`) puts `~/.ssh` "inside" it, and while seatbelt's
-/// secret denies come last and would still hold, bwrap's narrow scope has no
-/// mask to put back over an exact bind.
+/// Nor is anything bwrap's host scope masks: the credential deny list
+/// (`crate::sandbox::secrets`, whoever's it is), friring's sandbox state, gate
+/// and signal trees, and the database. A config directory relocated to an
+/// ancestor of the home or the data directory (`FRIRING_CONFIG_DIR=~`) puts
+/// all of those "inside" it, and while seatbelt's denies come last and would
+/// still hold, bwrap's narrow scope has no mask to put back over an exact bind
+/// — which follows a symlink, so the check is on the target.
 fn managed_config_reads(args: &[String], config_root: &str, home: &str) -> Vec<String> {
-    use crate::sandbox::secrets::{secrets_for, SecretPlatform};
+    use crate::sandbox::{
+        dirs,
+        secrets::{secrets_for, SecretPlatform},
+    };
     let Ok(root) = std::fs::canonicalize(config_root) else {
         return Vec::new();
     };
-    let secrets: Vec<std::path::PathBuf> = [SecretPlatform::MacOs, SecretPlatform::Linux]
+    let secrets = [SecretPlatform::MacOs, SecretPlatform::Linux]
         .into_iter()
         .flat_map(|platform| secrets_for(platform, None))
-        .map(|secret| {
-            let path = secret.resolved(home);
-            std::fs::canonicalize(&path).unwrap_or_else(|_| path.into())
-        })
+        .map(|secret| secret.resolved(home));
+    let friring_trees = [
+        dirs::sandbox_root(),
+        dirs::gate_root(),
+        crate::paths::signals_directory(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|dir| dir.display().to_string());
+    let database = crate::paths::database_file()
+        .map(|db| dirs::database_files(&db.display().to_string()))
+        .unwrap_or_default();
+    let protected: Vec<std::path::PathBuf> = secrets
+        .chain(friring_trees)
+        .chain(database)
+        .map(|path| std::fs::canonicalize(&path).unwrap_or_else(|_| path.into()))
         .collect();
     let mut out: Vec<String> = Vec::new();
     for path in crate::agent::config_args::collect_config_paths(args, config_root) {
@@ -496,7 +513,7 @@ fn managed_config_reads(args: &[String], config_root: &str, home: &str) -> Vec<S
         };
         if !target.starts_with(&root)
             || !target.is_file()
-            || secrets.iter().any(|secret| target.starts_with(secret))
+            || protected.iter().any(|tree| target.starts_with(tree))
         {
             continue;
         }
@@ -3591,45 +3608,56 @@ mod tests {
         assert!(!bound(&missing), "{:?}", wrapped.args);
     }
 
-    /// `FRIRING_CONFIG_DIR=~` makes the whole home "inside" the config
-    /// directory. A credential is still never granted — not named directly, not
-    /// through a symlink under `hooks/` — because bwrap's narrow scope has no
-    /// secret mask that would take an exact bind back.
+    /// A config directory over the home and the data directory
+    /// (`FRIRING_CONFIG_DIR=~`, and the layout every test here already has)
+    /// puts everything bwrap's host scope masks "inside" it. None of it is ever
+    /// granted — not named directly, not through a symlink under `hooks/` —
+    /// because bwrap's narrow scope has no mask that would take an exact bind
+    /// back.
     #[cfg(unix)]
     #[test]
-    fn a_config_dir_over_the_home_still_grants_no_credential() {
-        let home = std::env::temp_dir().join(format!("frs{}-cfghome", std::process::id()));
-        let hooks = home.join("hooks");
-        std::fs::create_dir_all(&hooks).unwrap();
-        std::fs::create_dir_all(home.join(".ssh")).unwrap();
-        let key = home.join(".ssh").join("id_ed25519");
-        std::fs::write(&key, "not a key").unwrap();
-        let settings = hooks.join("claude.json");
-        std::fs::write(&settings, "{}").unwrap();
-        let alias = hooks.join("alias.json");
-        let _ = std::fs::remove_file(&alias);
-        std::os::unix::fs::symlink(&key, &alias).unwrap();
-
-        let home_str = home.display().to_string();
-        let args: Vec<String> = [&settings, &key, &alias]
+    fn a_config_dir_over_the_home_grants_nothing_a_mask_would_hide() {
+        let _paths = fabricated_data_dir("cfghome");
+        let base = crate::agent::config_args::managed_root().unwrap();
+        let base = std::path::Path::new(&base);
+        let _ = std::fs::remove_dir_all(base);
+        let write = |rel: &str| {
+            let path = base.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "x").unwrap();
+            path
+        };
+        let settings = write("hooks/claude.json");
+        let mut named = vec![
+            write(".ssh/id_ed25519"),
+            write("friring.db"),
+            write("gates/s9/release"),
+            write("sandbox/pl/dev/login.json"),
+            write("signals/s9/state"),
+        ];
+        let aliases: Vec<std::path::PathBuf> = [("key.json", &named[0]), ("db.json", &named[1])]
             .into_iter()
+            .map(|(alias, target)| {
+                let alias = base.join("hooks").join(alias);
+                std::os::unix::fs::symlink(target, &alias).unwrap();
+                alias
+            })
+            .collect();
+        named.extend(aliases);
+
+        let args: Vec<String> = std::iter::once(&settings)
+            .chain(&named)
             .flat_map(|path| ["--settings".to_string(), path.display().to_string()])
             .collect();
-        let reads = managed_config_reads(&args, &home_str, &home_str);
+        let base_str = base.display().to_string();
+        let reads = managed_config_reads(&args, &base_str, &base_str);
 
         assert!(reads.contains(&settings.display().to_string()), "{reads:?}");
         assert!(
-            !reads
-                .iter()
-                .any(|p| p.contains(".ssh") || p.ends_with("alias.json")),
+            reads.iter().all(|p| p.ends_with("hooks/claude.json")),
             "{reads:?}"
         );
-        let _ = std::fs::remove_file(&alias);
-        let _ = std::fs::remove_file(&settings);
-        let _ = std::fs::remove_file(&key);
-        let _ = std::fs::remove_dir(home.join(".ssh"));
-        let _ = std::fs::remove_dir(&hooks);
-        let _ = std::fs::remove_dir(&home);
+        let _ = std::fs::remove_dir_all(base);
     }
 
     /// Claude Code ignores TMPDIR for its own scratch and dies on the `/tmp`
