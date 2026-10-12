@@ -970,9 +970,14 @@ fn build(
     // that has no such binary beside it. A policy backend refuses the launch
     // when it is missing.
     let helper = local_helper_program();
-    // A place carries these files in by projection, further down.
+    // A place carries these files in by projection, further down. The bypass
+    // flags are scanned too: they join the agent's argv below, so a path one
+    // names is read exactly like a path in `args`.
     let config_reads = match (&ensured, crate::agent::config_args::managed_root()) {
-        (None, Some(root)) => managed_config_reads(args, &root),
+        (None, Some(root)) => {
+            let agent_args: Vec<String> = args.iter().chain(&plan.extra_args).cloned().collect();
+            managed_config_reads(&agent_args, &root)
+        }
         _ => Vec::new(),
     };
     let mut launch = SandboxLaunch::new(&policy, home, &session_key)
@@ -3488,11 +3493,23 @@ mod tests {
         let escape = hooks.join("escape.json");
         let _ = std::fs::remove_file(&escape);
         std::os::unix::fs::symlink(&outside, &escape).unwrap();
+        // A bypass flag joins the agent's argv too, so what it names is read
+        // the same way.
+        let bypass = hooks.join("bypass.json");
+        std::fs::write(&bypass, "{}").unwrap();
 
         let mut profile = closed_profile();
         profile.read_scope = crate::session::ReadScope::Workspace;
         let per_session = per_session.display().to_string();
         let escape = escape.display().to_string();
+        let bypass_target = std::fs::canonicalize(&bypass).unwrap();
+        let bypass = bypass.display().to_string();
+        let mut def = agent_def();
+        def.sandbox
+            .as_mut()
+            .unwrap()
+            .bypass
+            .extend(["--bypass-settings".to_string(), bypass.clone()]);
         let args = vec![
             "--settings".to_string(),
             per_session.clone(),
@@ -3502,7 +3519,7 @@ mod tests {
         let wrapped = build(
             &stub_host(),
             "/fabricated/home",
-            Some(&agent_def()),
+            Some(&def),
             &config_with(Some(profile)),
             "claude",
             &args,
@@ -3522,6 +3539,12 @@ mod tests {
         assert!(bound(&target.display().to_string()), "{:?}", wrapped.args);
         assert!(!bound(&escape), "{:?}", wrapped.args);
         assert!(!bound(&outside.display().to_string()), "{:?}", wrapped.args);
+        assert!(bound(&bypass), "{:?}", wrapped.args);
+        assert!(
+            bound(&bypass_target.display().to_string()),
+            "{:?}",
+            wrapped.args
+        );
     }
 
     /// Claude Code ignores TMPDIR for its own scratch and dies on the `/tmp`
