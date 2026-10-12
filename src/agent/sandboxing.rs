@@ -3497,6 +3497,11 @@ mod tests {
         // the same way.
         let bypass = hooks.join("bypass.json");
         std::fs::write(&bypass, "{}").unwrap();
+        // Only a regular file is granted: not a directory, not a path that
+        // resolves to nothing.
+        let dir = hooks.join("sessions");
+        let missing = hooks.join("missing.json");
+        let _ = std::fs::remove_file(&missing);
 
         let mut profile = closed_profile();
         profile.read_scope = crate::session::ReadScope::Workspace;
@@ -3510,11 +3515,18 @@ mod tests {
             .unwrap()
             .bypass
             .extend(["--bypass-settings".to_string(), bypass.clone()]);
+        let dir_target = std::fs::canonicalize(&dir).unwrap();
+        let dir = dir.display().to_string();
+        let missing = missing.display().to_string();
         let args = vec![
             "--settings".to_string(),
             per_session.clone(),
             "--extra".to_string(),
             escape.clone(),
+            "--dir".to_string(),
+            dir.clone(),
+            "--missing".to_string(),
+            missing.clone(),
         ];
         let wrapped = build(
             &stub_host(),
@@ -3545,6 +3557,13 @@ mod tests {
             "{:?}",
             wrapped.args
         );
+        assert!(!bound(&dir), "{:?}", wrapped.args);
+        assert!(
+            !bound(&dir_target.display().to_string()),
+            "{:?}",
+            wrapped.args
+        );
+        assert!(!bound(&missing), "{:?}", wrapped.args);
     }
 
     /// Claude Code ignores TMPDIR for its own scratch and dies on the `/tmp`
