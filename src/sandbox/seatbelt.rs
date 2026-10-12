@@ -2175,7 +2175,12 @@ mod tests {
         let policy = workspace_policy();
         let text = render_profile(&SandboxLaunch::new(&policy, "/Users/u", "s1"));
         assert!(text.contains(r#"(global-name "com.apple.cfprefsd.agent")"#));
-        assert!(text.contains(CFPREFS_SHM_RULE));
+        assert!(
+            text.contains(
+                r#"(allow ipc-posix-shm-read* (ipc-posix-name-regex #"^apple\.cfprefs\."))"#
+            ),
+            "{text}"
+        );
         // Only the shared-memory read: cfprefsd answers lookups from this
         // profile, so granting the preference operations would hand out values.
         assert!(!text.contains("(allow user-preference"));
