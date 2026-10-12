@@ -146,9 +146,10 @@ impl SecretKey {
 
 /// Whether `name` is a POSIX environment-variable name.
 ///
-/// Shared with [`super`], which holds every variable it takes from a
-/// declaration to the same rule before it reaches a `tmux setenv`.
-pub(super) fn is_env_name(name: &str) -> bool {
+/// Shared with [`super`] and the launch composer, which hold every variable
+/// they take from a declaration to the same rule before it reaches a
+/// `tmux setenv`.
+pub(crate) fn is_env_name(name: &str) -> bool {
     let mut chars = name.chars();
     chars
         .next()

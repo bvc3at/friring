@@ -1602,7 +1602,10 @@ does read in `tmp_env`, and gets the same directory there: Claude Code ignores
 `TMPDIR` for its own tree and otherwise dies on `EPERM … open '/tmp/claude-<uid>'`,
 so the built-in claude declares `tmp_env = ["CLAUDE_CODE_TMPDIR"]`. A declared
 name that collides with one friring sets itself — the signal file, the proxy, a
-credential — is overruled by friring's value.
+credential — is overruled by friring's value. An entry that is not a variable
+name (`HTTPS_PROXY=x`) is skipped, as a malformed `config_dir_env` is: tmux
+would read its `NAME=VALUE` as one more assignment to `HTTPS_PROXY`, past that
+precedence.
 
 ## Launch integration
 
@@ -1782,8 +1785,12 @@ under friring's config directory that an argument names — the hooks extension'
 is added read-only, with the file it resolves to. Without it claude dies on
 "Error processing settings: EPERM" under every profile that does not list the
 config directory, which no profile should have to. A path that resolves *out* of
-the config directory, or to anything but a regular file, is not granted. A place
-gets these files projected instead (see [Config projection](#config-projection)).
+the config directory, or to anything but a regular file, is not granted. Nor is
+anything on the [credential deny list](#credentials): a config directory
+relocated over the home (`FRIRING_CONFIG_DIR=~`) would otherwise let an argument
+name `~/.ssh/…`, and bwrap's narrow scope has no secret mask to put back over an
+exact bind the way seatbelt's trailing denies do. A place gets these files
+projected instead (see [Config projection](#config-projection)).
 
 What the program then *opens* is still the profile's to grant. An extension that
 ships its agent as a shell script sourcing a library beside it needs its own
