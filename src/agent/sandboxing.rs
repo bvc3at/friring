@@ -461,6 +461,39 @@ fn local_helper_program() -> Option<String> {
 #[cfg(test)]
 pub(crate) const TEST_HELPER_PROGRAM: &str = "/usr/local/bin/friring-cli";
 
+/// The files under `config_root` that `args` names, for a policy launch to read
+/// ([`SandboxLaunch::config_files`]).
+///
+/// The hooks extension's `--settings` arrives repointed at a per-session
+/// symlink to the shared `claude.json` (`session_ops::builtin_hooks`), so each
+/// path is granted together with what it resolves to — and only when that is a
+/// regular file still inside the config directory. A symlink there that friring
+/// did not make would otherwise turn "read friring's hook file" into "read
+/// whatever it points at".
+fn managed_config_reads(args: &[String], config_root: &str) -> Vec<String> {
+    let Ok(root) = std::fs::canonicalize(config_root) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for path in crate::agent::config_args::collect_config_paths(args, config_root) {
+        let Ok(target) = std::fs::canonicalize(&path) else {
+            continue;
+        };
+        if !target.starts_with(&root) || !target.is_file() {
+            continue;
+        }
+        let Some(target) = target.to_str() else {
+            continue;
+        };
+        for granted in [path.as_str(), target] {
+            if !out.iter().any(|p| p == granted) {
+                out.push(granted.to_string());
+            }
+        }
+    }
+    out
+}
+
 /// Run `wrap` against the host friring itself runs on — or, in a test, the one
 /// it installed.
 ///
@@ -743,8 +776,17 @@ fn build(
 
     // The private directory is useful only when programs can discover it.
     // Override inherited host temp variables after applying the agent's static
-    // environment so every tool lands in this launch's boundary-owned scratch.
-    for key in ["TMPDIR", "TMP", "TEMP"] {
+    // environment so every tool lands in this launch's boundary-owned scratch —
+    // including any variable the agent declares it reads instead (`tmp_env`).
+    // Inserted before everything below, so a declared name that collides with
+    // one of friring's own is overruled by it.
+    let declared_tmp = agent_sandbox
+        .map(|s| s.tmp_env.as_slice())
+        .unwrap_or_default();
+    for key in ["TMPDIR", "TMP", "TEMP"]
+        .into_iter()
+        .chain(declared_tmp.iter().map(String::as_str))
+    {
         policy.insert_env(key, tmp_dir.clone());
     }
 
@@ -928,9 +970,15 @@ fn build(
     // that has no such binary beside it. A policy backend refuses the launch
     // when it is missing.
     let helper = local_helper_program();
+    // A place carries these files in by projection, further down.
+    let config_reads = match (&ensured, crate::agent::config_args::managed_root()) {
+        (None, Some(root)) => managed_config_reads(args, &root),
+        _ => Vec::new(),
+    };
     let mut launch = SandboxLaunch::new(&policy, home, &session_key)
         .with_tmp_dir(&tmp_dir)
         .with_agent_program(command)
+        .with_config_files(&config_reads)
         .with_host_mux(crate::agent::tmux::host_mux_sockets());
     if let Some(helper) = helper.as_deref() {
         launch = launch.with_helper_program(helper);
@@ -3414,5 +3462,94 @@ mod tests {
             "{} outlived the session",
             minted.display()
         );
+    }
+
+    /// friring puts its own hook file on a claude launch's argv (`--settings`,
+    /// repointed at a per-session symlink), and the narrow scope grants nothing
+    /// under the config directory — so without this the pane dies on startup
+    /// with "Error processing settings: EPERM". The symlink's target is what the
+    /// kernel opens, so it is granted too; a symlink leading *out* of the config
+    /// directory is friring's to refuse, not to follow.
+    #[cfg(unix)]
+    #[test]
+    fn a_policy_launch_can_read_the_hook_file_friring_put_on_its_argv() {
+        let _paths = fabricated_data_dir("cfgread");
+        let root = crate::agent::config_args::managed_root().unwrap();
+        let hooks = std::path::Path::new(&root).join("hooks");
+        std::fs::create_dir_all(hooks.join("sessions")).unwrap();
+        let shared = hooks.join("claude.json");
+        std::fs::write(&shared, "{}").unwrap();
+        let per_session = hooks.join("sessions").join("s1.json");
+        let _ = std::fs::remove_file(&per_session);
+        std::os::unix::fs::symlink(&shared, &per_session).unwrap();
+        let outside =
+            std::env::temp_dir().join(format!("frs{}-cfgread-outside", std::process::id()));
+        std::fs::write(&outside, "not friring's").unwrap();
+        let escape = hooks.join("escape.json");
+        let _ = std::fs::remove_file(&escape);
+        std::os::unix::fs::symlink(&outside, &escape).unwrap();
+
+        let mut profile = closed_profile();
+        profile.read_scope = crate::session::ReadScope::Workspace;
+        let per_session = per_session.display().to_string();
+        let escape = escape.display().to_string();
+        let args = vec![
+            "--settings".to_string(),
+            per_session.clone(),
+            "--extra".to_string(),
+            escape.clone(),
+        ];
+        let wrapped = build(
+            &stub_host(),
+            "/fabricated/home",
+            Some(&agent_def()),
+            &config_with(Some(profile)),
+            "claude",
+            &args,
+            None,
+        )
+        .unwrap();
+
+        let bound = |path: &str| {
+            wrapped
+                .args
+                .windows(3)
+                .any(|w| w[0] == "--ro-bind-try" && w[1] == path && w[2] == path)
+        };
+        let target = std::fs::canonicalize(&shared).unwrap();
+        let outside = std::fs::canonicalize(&outside).unwrap();
+        assert!(bound(&per_session), "{:?}", wrapped.args);
+        assert!(bound(&target.display().to_string()), "{:?}", wrapped.args);
+        assert!(!bound(&escape), "{:?}", wrapped.args);
+        assert!(!bound(&outside.display().to_string()), "{:?}", wrapped.args);
+    }
+
+    /// Claude Code ignores TMPDIR for its own scratch and dies on the `/tmp`
+    /// every profile denies; `tmp_env` points the variable it does read at the
+    /// launch's scratch. A name friring sets itself stays friring's.
+    #[test]
+    fn a_declared_tmp_variable_names_the_launchs_scratch_too() {
+        let mut config = config_with(Some(closed_profile()));
+        config.agent_session_id = Some("tmp-env-test".into());
+        let mut def = agent_def();
+        def.sandbox.as_mut().unwrap().tmp_env = vec![
+            "CLAUDE_CODE_TMPDIR".to_string(),
+            crate::paths::SIGNAL_FILE_ENV.to_string(),
+        ];
+        let wrapped = build(
+            &stub_host(),
+            "/fabricated/home",
+            Some(&def),
+            &config,
+            "claude",
+            &[],
+            None,
+        )
+        .unwrap();
+
+        let scratch = wrapped.env.get("TMPDIR").cloned().unwrap();
+        assert_eq!(wrapped.env.get("CLAUDE_CODE_TMPDIR"), Some(&scratch));
+        let signal = wrapped.env.get(crate::paths::SIGNAL_FILE_ENV);
+        assert!(signal.is_some_and(|v| v != &scratch), "{signal:?}");
     }
 }

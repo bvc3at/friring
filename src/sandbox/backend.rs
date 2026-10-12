@@ -608,6 +608,17 @@ pub struct SandboxLaunch<'a> {
     /// directories the scope already allows, and for a place backend, whose
     /// filesystem is the place's own.
     pub agent_program: Option<&'a str>,
+    /// Files under friring's own config directory that the agent's arguments
+    /// name — the hooks extension's `--settings <config dir>/hooks/claude.json`
+    /// — read-only, for the narrow scope.
+    ///
+    /// friring put them on the command line, so an agent that cannot read them
+    /// is a pane that dies on startup ("Error processing settings: EPERM"), and
+    /// no operator should have to grant friring's config directory to every
+    /// profile by hand. A place gets the same files projected instead
+    /// ([`crate::sandbox::projection`]). Absolute, and already checked to
+    /// resolve inside the config directory, by the caller.
+    pub config_files: &'a [String],
     /// The multiplexer sockets on this host, for the closed deny set every
     /// policy launch renders
     /// ([`crate::sandbox::dirs::multiplexer_socket_denies`]).
@@ -640,6 +651,7 @@ impl<'a> SandboxLaunch<'a> {
             narrowing: None,
             helper_program: None,
             agent_program: None,
+            config_files: &[],
             host_mux: None,
             proxy: None,
             place: None,
@@ -768,6 +780,13 @@ impl<'a> SandboxLaunch<'a> {
         if program.starts_with('/') {
             self.agent_program = Some(program);
         }
+        self
+    }
+
+    /// friring-managed files the agent's argv names — see
+    /// [`config_files`](Self::config_files).
+    pub fn with_config_files(mut self, files: &'a [String]) -> Self {
+        self.config_files = files;
         self
     }
 

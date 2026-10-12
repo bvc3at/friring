@@ -108,9 +108,11 @@ const DEVICE_FILTERS: &[&str] = &[
 /// agent can use items through `securityd`'s per-item prompts but cannot copy
 /// the store.
 ///
-/// The last two are not about credentials: without `opendirectoryd.libinfo` a
-/// `getpwuid` fails and most CLIs cannot resolve `$HOME` or the user name, and
-/// `notification_center` is `notify(3)`, which libsystem itself calls.
+/// The last three are not about credentials: without `opendirectoryd.libinfo` a
+/// `getpwuid` fails and most CLIs cannot resolve `$HOME` or the user name,
+/// `notification_center` is `notify(3)`, which libsystem itself calls, and
+/// `cfprefsd.agent` is the per-user half of CFPreferences (see
+/// [`CFPREFS_SHM_RULE`]).
 const MACH_SERVICES: &[(&str, &str)] = &[
     ("com.apple.SecurityServer", "keychain item access"),
     ("com.apple.securityd", "the modern name of the same daemon"),
@@ -132,7 +134,23 @@ const MACH_SERVICES: &[(&str, &str)] = &[
         "com.apple.system.notification_center",
         "notify(3), called from inside libsystem",
     ),
+    (
+        "com.apple.cfprefsd.agent",
+        "per-user CFPreferences; values stay behind user-preference-read",
+    ),
 ];
+
+/// Read access to cfprefsd's shared-memory segments, the other half of a
+/// per-user CFPreferences lookup.
+///
+/// Without this and `cfprefsd.agent`, a preference read *fails* instead of
+/// coming back empty. Codex reads its managed `com.openai.codex` preferences on
+/// every start and exits on that failure ("failed to load workspace
+/// requirements"). The values themselves are not opened up: cfprefsd checks the
+/// caller's profile, and `(deny default)` still denies `user-preference-read`,
+/// so a lookup returns "does not exist".
+const CFPREFS_SHM_RULE: &str =
+    r#"(allow ipc-posix-shm-read* (ipc-posix-name-regex #"^apple\.cfprefs\."))"#;
 
 /// Mach services needed to resolve a host name.
 ///
@@ -287,6 +305,7 @@ pub fn render_profile(launch: &SandboxLaunch<'_>) -> String {
         "(allow mach-lookup\n    {}\n)",
         services.join("\n    ")
     ));
+    out.push(CFPREFS_SHM_RULE.to_string());
 
     render_reads(&mut out, launch, &readable);
     render_network(&mut out, launch);
@@ -382,7 +401,8 @@ fn render_reads(out: &mut Vec<String>, launch: &SandboxLaunch<'_>, readable: &[P
             // the **agent's** program is what that helper then execs — an
             // extension that ships its agent as a script under its own home is
             // outside every system directory, and no operator should have to add
-            // it to a profile by hand.
+            // it to a profile by hand. The friring-managed files the agent's
+            // argv names join them for the same reason.
             let filters: Vec<String> = SYSTEM_READ_PATHS
                 .iter()
                 .map(|p| format!("(subpath {p:?})"))
@@ -391,7 +411,8 @@ fn render_reads(out: &mut Vec<String>, launch: &SandboxLaunch<'_>, readable: &[P
                         .helper_program
                         .into_iter()
                         .chain(launch.agent_program)
-                        .map(|program| format!("(literal {program:?})")),
+                        .chain(launch.config_files.iter().map(String::as_str))
+                        .map(|path| format!("(literal {path:?})")),
                 )
                 .chain(std::iter::once("(literal \"/\")".to_string()))
                 .collect();
@@ -1971,6 +1992,30 @@ mod tests {
         assert!(!text.contains("(literal \"codex\")"), "{text}");
     }
 
+    /// The hook file friring hands an agent on its argv is readable under the
+    /// narrow scope, read-only — the pane otherwise dies on "Error processing
+    /// settings: EPERM" before the agent starts.
+    #[test]
+    fn the_workspace_scope_reads_the_config_files_on_the_agents_argv() {
+        const HOOKS: &str = "/Users/u/.config/friring/hooks/claude.json";
+        let mut profile = SandboxProfile::new("dev", vec![SandboxPath::workspace("/srv/work")]);
+        profile.read_scope = ReadScope::Workspace;
+        let policy = profile
+            .resolve(SandboxBackendKind::Seatbelt, "/Users/u")
+            .unwrap();
+        let files = [HOOKS.to_string()];
+        let text = render_profile(
+            &SandboxLaunch::new(&policy, "/Users/u", "s1")
+                .with_helper_program(HELPER)
+                .with_config_files(&files),
+        );
+        assert!(text.contains(&format!("(literal {HOOKS:?})")), "{text}");
+        assert!(
+            !text.contains(&format!("file-write* (literal {HOOKS:?})")),
+            "{text}"
+        );
+    }
+
     #[test]
     fn session_paths_are_parameters_not_baked_in() {
         let policy = workspace_policy();
@@ -2123,6 +2168,18 @@ mod tests {
         // The Keychain *database* is still denied: items stay reachable through
         // securityd's per-item prompts, the store cannot be copied wholesale.
         assert!(text.contains(r#"(subpath "/Users/u/Library/Keychains")"#));
+    }
+
+    #[test]
+    fn per_user_preferences_are_reachable_but_their_values_are_not() {
+        let policy = workspace_policy();
+        let text = render_profile(&SandboxLaunch::new(&policy, "/Users/u", "s1"));
+        assert!(text.contains(r#"(global-name "com.apple.cfprefsd.agent")"#));
+        assert!(text.contains(CFPREFS_SHM_RULE));
+        // Only the shared-memory read: cfprefsd answers lookups from this
+        // profile, so granting the preference operations would hand out values.
+        assert!(!text.contains("(allow user-preference"));
+        assert!(!text.contains("(allow ipc-posix-shm*"));
     }
 
     #[test]

@@ -412,12 +412,15 @@ pub fn build_argv_with(
         // the profile's own paths, like every other default, so a path the user
         // listed still wins. `--ro-bind-try`, because a bare command name has no
         // path to bind and a helper friring could not resolve refuses earlier.
-        for program in launch
+        // The friring-managed files the agent's argv names are bound the same
+        // way, for the same reason.
+        for path in launch
             .helper_program
             .into_iter()
             .chain(launch.agent_program)
+            .chain(launch.config_files.iter().map(String::as_str))
         {
-            push(&mut argv, &["--ro-bind-try", program, program]);
+            push(&mut argv, &["--ro-bind-try", path, path]);
         }
     }
 

@@ -169,6 +169,9 @@ copy_in = ["~/.claude/skills"]   # config safe to project into a container,
                             #   naming a host path is dropped, and a credential
                             #   never crosses (ADR-28)
 # env = { DISABLE_AUTOUPDATER = "1" }  # static env while a sandbox is active
+tmp_env = ["CLAUDE_CODE_TMPDIR"]  # extra variables set to the launch's private
+                            #   scratch dir, alongside TMPDIR/TMP/TEMP — for a
+                            #   CLI that ignores those (the host /tmp is denied)
 # secret_env = ["ANTHROPIC_API_KEY"]   # token variable NAMES only; the value
                             #   lives in your OS keychain under the service
                             #   "dev.friring.sandbox", never here — put one
