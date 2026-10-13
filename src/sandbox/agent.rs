@@ -68,7 +68,13 @@ pub fn compose_inner_sandbox(
         verdict,
         declared,
         extra_args: agent.map(|a| a.bypass.clone()).unwrap_or_default(),
-        env: agent.map(|a| a.env.clone()).unwrap_or_default(),
+        env: agent
+            .map(|a| {
+                declared_env(a)
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            })
+            .unwrap_or_default(),
         label: format!(
             "sandbox: {} ({}) · inner agent sandbox: {state}",
             policy.profile, policy.backend
@@ -110,9 +116,23 @@ pub fn apply_agent_requirements(
     readable.retain(|p| !policy.rw_paths.contains(p));
     policy.ro_paths = readable;
 
-    for (key, value) in &agent.env {
+    for (key, value) in declared_env(agent) {
         policy.insert_env(key.clone(), value.clone());
     }
+}
+
+/// The agent's static `env`, without an entry whose key is not a variable name.
+///
+/// The boundary's own variables win by being inserted last into a map keyed by
+/// name, and `HTTPS_PROXY=x` is a different key from `HTTPS_PROXY`: it survives
+/// that precedence, and tmux then reads its `-e NAME=VALUE` as one more
+/// assignment to `HTTPS_PROXY`. The same rule `config_dir_env` and `tmp_env`
+/// are held to.
+fn declared_env(agent: &AgentSandboxDef) -> impl Iterator<Item = (&String, &String)> {
+    agent
+        .env
+        .iter()
+        .filter(|(name, _)| crate::sandbox::auth::keychain::is_env_name(name))
 }
 
 #[cfg(test)]
@@ -200,6 +220,22 @@ mod tests {
             .contains(&"/Users/other/.claude".to_string()));
         // The profile's own paths were expanded earlier, against their own home.
         assert!(policy.rw_paths.contains(&"/home/u/dev/app".to_string()));
+    }
+
+    #[test]
+    fn a_declared_env_key_that_is_not_a_name_is_never_set() {
+        let mut agent = claude();
+        agent.env.insert("HTTPS_PROXY=x".into(), "y".into());
+        let mut policy = policy();
+        apply_agent_requirements(&mut policy, Some(&agent), "/home/u");
+        let plan = compose_inner_sandbox(&policy, InnerSandboxVerdict::Denied, Some(&agent));
+
+        for keys in [
+            policy.env.keys().collect::<Vec<_>>(),
+            plan.env.keys().collect::<Vec<_>>(),
+        ] {
+            assert_eq!(keys, ["DISABLE_AUTOUPDATER"]);
+        }
     }
 
     #[test]

@@ -351,6 +351,23 @@ actually needs and to an allowlist of domains.
   `<data dir>/sandbox/profiles/`. The host temp root is never granted: friring's
   own tmux server socket lives there, and a network namespace does not stop
   `connect(2)` on a pathname unix socket.
+- **The seeded claude and codex start under a narrow policy profile** — three
+  gaps each killed one of them at launch. Claude Code ignores `TMPDIR` for its
+  own scratch tree and died on `/tmp/claude-<uid>`, so `[agents.sandbox]` gains
+  `tmp_env`, naming further variables that receive the launch's scratch
+  directory, and the built-in claude declares `CLAUDE_CODE_TMPDIR`. The hooks
+  extension's `--settings` file under friring's config directory was unreadable
+  under the `workspace` read scope, so a policy launch now adds every regular
+  file inside that directory its argv names, read-only, with the file a symlink
+  resolves to; a path resolving out of it is not granted. Codex reads its managed
+  preferences through cfprefsd on every start, so seatbelt allows
+  `com.apple.cfprefsd.agent` and its `apple.cfprefs.*` shared memory, with
+  `user-preference-read` still denied. Separately, the built-in codex adds
+  `--no-daemon` to its `bypass` flags: a plain interactive codex hands its
+  commands to a shared server running outside the boundary, and a `touch`
+  outside every granted path succeeded through it. Existing `agents.toml`
+  files are never rewritten, so an operator's own claude and codex entries need
+  the same lines added by hand.
 - **The host multiplexer's sockets are denied inside every policy sandbox** —
   `connect(2)` on a pathname unix socket is a filesystem operation no network
   namespace stops, and SBPL models one as a *network* operation, so an

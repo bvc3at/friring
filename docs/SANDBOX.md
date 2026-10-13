@@ -405,6 +405,15 @@ by the backend being pluggable.
   native TLS uses for certificate-chain validation; without it, HTTPS can fail
   inside seatbelt while a WebSocket client using a different TLS stack succeeds
   against the same host.
+- **CFPreferences works, preference values do not.** The profile also allows
+  `com.apple.cfprefsd.agent` and read-only access to cfprefsd's `apple.cfprefs.*`
+  shared memory. Without them a per-user preference lookup *fails* rather than
+  coming back empty, and Codex (observed on codex-cli 0.160.0 and 0.161.0)
+  reads its managed `com.openai.codex` preferences on every start and exits
+  with "failed to load workspace requirements". `user-preference-read` stays denied
+  and cfprefsd enforces it against the caller, so a lookup from inside returns
+  "does not exist" — `defaults read -g AppleLocale` answers on the host and not
+  inside the boundary.
 - **Network granularity is all-or-localhost.** SBPL host filters accept only
   `*` or `localhost` (with ports); there is no domain predicate. Domain
   allowlists therefore mean: deny all outbound except the loopback proxy port.
@@ -1478,6 +1487,18 @@ sandbox profile is active, and the UI states the composition plainly:
 sandbox: friring-dev (seatbelt) · inner agent sandbox: off — Friring is the boundary
 ```
 
+An agent's **background server** is the same problem from the other side. Codex
+(observed on codex-cli 0.161.0) attaches a plain interactive launch to a shared
+server it keeps running on the host, reached over a socket under `~/.codex`, and
+that server — not the pane's process — runs the commands. Under a `full` profile
+the socket is reachable, so a `touch` outside every granted path succeeded from a
+sandboxed codex while the same `touch` under the same generated profile was
+refused. The built-in codex therefore lists `--no-daemon` among its `bypass`
+flags, which keeps the whole agent inside the boundary. That is a declaration
+the agent honours, not something the boundary enforces: a process inside can
+still dial the socket itself. An `agents.toml` seeded earlier lacks the flag, so
+add it to your codex entry's `bypass` by hand ([CONFIG.md](CONFIG.md#agentstoml)).
+
 The tradeoff is real and worth stating in the docs: with the inner sandbox off,
 anything inside the boundary — including the agent's own credentials — is
 reachable by whatever the agent runs. That is an argument for narrow profiles
@@ -1572,6 +1593,19 @@ as directories — claude declares `~/.claude.json`, codex keeps `auth.json`
 inside its state directory — and nesting says nothing about which an absent
 entry would have been. A directory created where the agent wanted a file breaks
 it more thoroughly than the missing mount does.
+
+**Scratch is minted, not declared.** Every launch gets a private scratch
+directory and `TMPDIR`, `TMP` and `TEMP` pointing at it, because the host temp
+root holds friring's own tmux socket and no profile grants it. An agent that
+keeps its scratch somewhere those variables do not reach names the variable it
+does read in `tmp_env`, and gets the same directory there: Claude Code ignores
+`TMPDIR` for its own tree and otherwise dies on `EPERM … open '/tmp/claude-<uid>'`,
+so the built-in claude declares `tmp_env = ["CLAUDE_CODE_TMPDIR"]`. A declared
+name that collides with one friring sets itself — the signal file, the proxy, a
+credential — is overruled by friring's value. An entry that is not a variable
+name (`HTTPS_PROXY=x`) is skipped, as a malformed `config_dir_env` or static
+`env` key is: tmux would read its `NAME=VALUE` as one more assignment to
+`HTTPS_PROXY`, past that precedence.
 
 ## Launch integration
 
@@ -1744,6 +1778,22 @@ opens a pane that dies before the agent starts. A bare command name is left
 alone: it resolves on `PATH` under directories the scope already allows, and
 turning it into a policy literal would name a path relative to whatever cwd the
 launch happened to have.
+
+The same goes for the **friring-managed files on the agent's argv**: anything
+under friring's config directory that an argument names — the hooks extension's
+`--settings <config dir>/hooks/claude.json`, repointed at a per-session symlink —
+is added read-only, with the file it resolves to. Without it claude dies on
+"Error processing settings: EPERM" under every profile that does not list the
+config directory, which no profile should have to. A path that resolves *out* of
+the config directory, or to anything but a regular file, is not granted. Nor is
+anything bwrap's host scope masks: the [credential deny list](#credentials),
+friring's sandbox state, gate and signal trees, and the database. A config
+directory relocated over the home or the data directory
+(`FRIRING_CONFIG_DIR=~`) would otherwise let an argument, or a symlink beside
+the hook file, name `~/.ssh/…` or `friring.db`. bwrap's narrow scope has no
+mask to put back over an exact bind the way seatbelt's trailing denies do, so
+the check is made on the resolved target. A place gets these files
+projected instead (see [Config projection](#config-projection)).
 
 What the program then *opens* is still the profile's to grant. An extension that
 ships its agent as a shell script sourcing a library beside it needs its own

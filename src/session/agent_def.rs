@@ -249,6 +249,15 @@ pub struct AgentSandboxDef {
     /// Static environment applied whenever a sandbox is active.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Further environment variables that receive the launch's private scratch
+    /// directory, alongside `TMPDIR`, `TMP` and `TEMP` — for an agent that keeps
+    /// its scratch somewhere those do not reach (Claude Code's
+    /// `CLAUDE_CODE_TMPDIR`; without it, it writes under `/tmp/claude-<uid>`,
+    /// which every profile denies, and dies on startup). Names only: the
+    /// directory is minted per launch, so no static value in
+    /// [`env`](Self::env) could name it.
+    #[serde(default)]
+    pub tmp_env: Vec<String>,
     /// Names of the environment variables that carry a long-lived token this
     /// agent accepts (`ANTHROPIC_API_KEY`, …) — **names only**. The values live
     /// in friring's own OS keychain entry and never in the registry, the

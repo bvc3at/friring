@@ -66,6 +66,10 @@ login_fallback = "/login"
 writeback = true
 state_rw = ["~/.claude", "~/.claude.json"]
 bypass = ["--dangerously-skip-permissions"]
+# Claude Code keeps its scratch under `/tmp/claude-<uid>`, ignoring TMPDIR, and
+# every profile denies the host temp root: pointed at the launch's own scratch
+# directory instead, it starts.
+tmp_env = ["CLAUDE_CODE_TMPDIR"]
 # Projected into a container's synthetic home at the same `~`-relative path,
 # after a lint pass that drops anything naming the host filesystem. Instructions,
 # skills and commands are prose and cross whole; a hook or MCP server pointing at
@@ -106,7 +110,10 @@ secret_env = ["OPENAI_API_KEY"]
 login_fallback = "codex login"
 writeback = true
 state_rw = ["~/.codex"]
-bypass = ["--dangerously-bypass-approvals-and-sandbox"]
+# `--no-daemon` keeps codex off its shared background server. That server runs
+# outside the boundary and executes the commands of every client attached to
+# it, and a sandboxed codex with the host's `~/.codex` reaches its socket.
+bypass = ["--dangerously-bypass-approvals-and-sandbox", "--no-daemon"]
 copy_in = ["~/.codex/AGENTS.md", "~/.codex/prompts"]
 
 # Rollouts are `sessions/<yyyy>/<mm>/<dd>/rollout-*.jsonl`, and the id in that
@@ -251,6 +258,8 @@ new_session_args = ["--session", "{home}/.omp/agent/sessions/friring-{id}.jsonl"
 # bypass = ["--no-sandbox"]     #   flags turning its OWN sandbox off, applied
 #                               #   only while a friring profile is active
 # env = { X = "1" }             #   static env applied whenever a sandbox is active
+# tmp_env = ["MY_AGENT_TMP"]    #   extra variables set to the launch's private
+#                               #   scratch dir, like TMPDIR/TMP/TEMP
 #
 # --- credentials in a container (nothing below applies to a policy sandbox,
 #     which just uses your real login) -------------------------------------
@@ -618,6 +627,17 @@ mod tests {
                 "{name} must use id-less resume/fork flags"
             );
         }
+    }
+
+    /// Both seeded agents start under a policy profile only because of a line
+    /// in their declaration: claude needs its scratch pointed into the boundary,
+    /// and codex has to stay off its background server, which runs outside it.
+    #[test]
+    fn the_seeded_agents_keep_their_scratch_and_their_commands_inside() {
+        let reg = builtin_registry();
+        let sandbox = |name: &str| reg.get(name).unwrap().sandbox.clone().unwrap();
+        assert_eq!(sandbox("claude").tmp_env, ["CLAUDE_CODE_TMPDIR"]);
+        assert!(sandbox("codex").bypass.iter().any(|f| f == "--no-daemon"));
     }
 
     /// The seeded declarations are what the credential strategies read
